@@ -880,4 +880,223 @@ class InstitutionalQuantRiskEngine:
 
 
 # =========================================================
-# 清晰版體質分析
+# 清晰版體質分析卡片與 Plotly 深色圖表
+# =========================================================
+def render_health_card(q: FundamentalQualityReport):
+    def _tag(val, good_cond, bad_cond, good_txt, mid_txt, bad_txt):
+        if val is None or pd.isna(val):
+            return '<span class="m-tag" style="color:#6e7681;">無資料</span>'
+        if good_cond(val):
+            return f'<span class="m-tag tag-good">{good_txt}</span>'
+        if bad_cond(val):
+            return f'<span class="m-tag tag-bad">{bad_txt}</span>'
+        return f'<span class="m-tag tag-mid">{mid_txt}</span>'
+
+    roe_t = _tag(q.roe_pct, lambda x: x >= 15, lambda x: x < 5, "優異", "穩健", "偏弱")
+    op_t = _tag(q.op_margin_pct, lambda x: x >= 15, lambda x: x < 3, "高毛利", "普通", "偏薄")
+    rev_t = _tag(q.rev_growth_pct, lambda x: x >= 15, lambda x: x <= -10, "高成長", "平穩", "衰退")
+    pe_t = _tag(q.pe, lambda x: 0 < x <= 16, lambda x: x >= 38 or x < 0, "便宜", "合理", "偏貴/虧損")
+    pb_t = _tag(q.pb, lambda x: 0 < x <= 2.0, lambda x: x >= 6.0, "低估", "合理", "溢價")
+
+    pb_str = f"{q.pb:.2f}x" if q.pb is not None else "N/A"
+    str_html = "".join([f"<div>✅ {s}</div>" for s in q.strengths])
+    warn_html = "".join([f"<div>⚠️ {w}</div>" for w in q.warnings]) if q.warnings else "<div>✨ 目前無明顯財務警訊</div>"
+
+    st.markdown(
+        f"""<div class="risk-card">
+        <div class="card-title">📊 個股財務體質健檢（來源：{q.source_note}）</div>
+        <div style="font-size:1.35rem;font-weight:700;color:#f0f6fc;">{q.quality_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{q.rating}】</div>
+        <div class="metric-grid">
+            <div class="metric-box"><div class="m-label">ROE 報酬率</div><div class="m-val">{_fmt_num(q.roe_pct, '%')}</div>{roe_t}</div>
+            <div class="metric-box"><div class="m-label">營業利益率</div><div class="m-val">{_fmt_num(q.op_margin_pct, '%')}</div>{op_t}</div>
+            <div class="metric-box"><div class="m-label">營收年增率</div><div class="m-val">{_fmt_num(q.rev_growth_pct, '%', signed=True)}</div>{rev_t}</div>
+            <div class="metric-box"><div class="m-label">本益比 PE</div><div class="m-val">{_fmt_num(q.pe, 'x')}</div>{pe_t}</div>
+            <div class="metric-box"><div class="m-label">淨值比 PB</div><div class="m-val">{pb_str}</div>{pb_t}</div>
+        </div>
+        <div class="health-list">{str_html}{warn_html}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_dark_chart(res: Dict):
+    df = res["hist_df"]
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07, row_heights=[0.62, 0.38]
+    )
+
+    fig.add_trace(go.Scatter(x=df.index, y=df["close"], name="收盤價", line=dict(color="#58a6ff", width=2.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["sell_p"], name="建議賣出價", line=dict(color="#d2a8ff", width=1.5, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["stop_p"], name="下檔防守價", line=dict(color="#f0883e", width=1.6, dash="dash")), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=df.index, y=df["mri"], name="大盤風險 (MRI)", line=dict(color="#ff7b72", width=2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["sri"], name="個股風險 (SRI)", line=dict(color="#3fb950", width=2, dash="dash")), row=2, col=1)
+
+    fig.add_hrect(y0=65, y1=100, fillcolor="rgba(255,123,114,0.12)", line_width=0, row=2, col=1)
+    fig.add_hrect(y0=0, y1=48, fillcolor="rgba(63,185,80,0.10)", line_width=0, row=2, col=1)
+    fig.add_hline(y=65, line_dash="dot", line_color="#ff7b72", opacity=0.7, row=2, col=1)
+    fig.add_hline(y=48, line_dash="dot", line_color="#3fb950", opacity=0.7, row=2, col=1)
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0b0e14",
+        plot_bgcolor="#161b22",
+        height=520,
+        margin=dict(l=10, r=10, t=35, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)),
+        hovermode="x unified",
+    )
+    fig.update_yaxes(title_text="股價", gridcolor="#30363d", row=1, col=1)
+    fig.update_yaxes(title_text="風險分", range=[0, 102], gridcolor="#30363d", row=2, col=1)
+    fig.update_xaxes(gridcolor="#30363d")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+# =========================================================
+# 側邊欄：FinMind Token 設定（選填）
+# =========================================================
+with st.sidebar:
+    st.markdown("### ⚙️ 系統連線設定")
+    st.text_input(
+        "FinMind API Token（選填）",
+        type="password",
+        key="user_finmind_token",
+        help="若遇到免費限流，可至 finmindtrade.com 免費申請 Token 填入。",
+    )
+    st.caption("燈號標準：\n🟢 安全 (<48)\n🟡 中等 (48~64)\n🔴 危險 (≥65)\n\n權重配置：大盤環境 40% ＋ 個股籌碼與體質 60%")
+
+
+# =========================================================
+# 主介面：雙分頁（單股一鍵查閱 / 多股批量掃描）
+# =========================================================
+st.markdown("## 🛡️ 台股量化風控儀表板")
+tab1, tab2 = st.tabs(["🔍 單股風控診斷", "📋 多股批量掃描"])
+
+engine = InstitutionalQuantRiskEngine()
+
+with tab1:
+    col_in, col_btn = st.columns([3, 1.2])
+    with col_in:
+        stock_input = st.text_input("輸入台股代號（上市／上櫃自動偵測）", value="2330", placeholder="例如 2330、2382、6274", label_visibility="collapsed")
+    with col_btn:
+        run_btn = st.button("一鍵分析", type="primary", use_container_width=True)
+
+    if stock_input.strip():
+        with st.spinner(f"正在運算 {stock_input.strip()} 量化風控與體質模型..."):
+            try:
+                res = engine.run_analysis(stock_input.strip())
+                m_icon, m_stat, m_col, m_cls = get_traffic_light(res["mri"])
+                s_icon, s_stat, s_col, s_cls = get_traffic_light(res["sri"])
+                sell_pct = (res["sell_p"] / res["close"] - 1) * 100
+                stop_pct = (res["stop_p"] / res["close"] - 1) * 100
+
+                st.markdown(f"### {res['display_name']}")
+                st.caption(f"基準日：{res['date']} ｜ 收盤價：{res['close']} 元 ｜ 籌碼：{res['stk_note']}")
+
+                # 第一排：個股風險 vs 大盤風險
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown(
+                        f"""<div class="risk-card">
+                        <div class="card-title">個股風險指數 (SRI)</div>
+                        <div class="card-value" style="color:{s_col};">{s_icon} {res['sri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
+                        <div class="card-sub"><span class="{s_cls}">{s_stat}</span> &nbsp;籌碼風險 {res['chip']}/100</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                with c2:
+                    st.markdown(
+                        f"""<div class="risk-card">
+                        <div class="card-title">大盤風險指數 (MRI)</div>
+                        <div class="card-value" style="color:{m_col};">{m_icon} {res['mri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
+                        <div class="card-sub"><span class="{m_cls}">{m_stat}</span> &nbsp;佔比權重 40%</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+
+                # 第二排：動態價位卡
+                c3, c4 = st.columns(2)
+                with c3:
+                    st.markdown(
+                        f"""<div class="risk-card">
+                        <div class="card-title">建議賣出價（目標調節區）</div>
+                        <div class="card-value" style="color:#d2a8ff;">{res['sell_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
+                        <div class="card-sub">距收盤 {sell_pct:+.1f}%</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                with c4:
+                    st.markdown(
+                        f"""<div class="risk-card">
+                        <div class="card-title">下檔防守價</div>
+                        <div class="card-value" style="color:#f0883e;">{res['stop_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
+                        <div class="card-sub">距收盤 {stop_pct:+.1f}%</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+
+                # 第三排：清楚的五大指標體質分析卡（標示資料來源）
+                render_health_card(res["quality"])
+
+                # 第四排：互動式走勢圖
+                render_dark_chart(res)
+
+            except Exception as e:
+                st.error(f"分析失敗：{e}")
+
+with tab2:
+    batch_input = st.text_area(
+        "輸入多檔代號（支援逗號、空白或換行分隔）",
+        value="2330, 2454, 2382, 6274, 2881",
+        height=72,
+    )
+    if st.button("開始批量掃描", type="primary", use_container_width=True):
+        raw_tokens = re.split(r"[,，\s\n]+", batch_input.strip())
+        tickers = list(dict.fromkeys([t.strip().upper() for t in raw_tokens if t.strip()]))
+
+        if not tickers:
+            st.warning("請先輸入至少一檔台股代號。")
+        else:
+            rows = []
+            prog = st.progress(0)
+            status_txt = st.empty()
+            for idx, tid in enumerate(tickers):
+                status_txt.caption(f"正在掃描 ({idx + 1}/{len(tickers)})：{tid} ...")
+                try:
+                    r = engine.run_analysis(tid, lookback_days=20, fast_batch=True)
+                    m_i, _, _, _ = get_traffic_light(r["mri"])
+                    s_i, s_st, _, _ = get_traffic_light(r["sri"])
+                    sell_pct = (r["sell_p"] / r["close"] - 1) * 100
+                    rows.append({
+                        "標的": r["display_name"],
+                        "收盤價": r["close"],
+                        "個股風險": f"{s_i} {r['sri']} ({s_st})",
+                        "籌碼分": r["chip"],
+                        "體質評等": f"{r['quality'].quality_score} ({r['quality'].rating.split()[0]})",
+                        "建議賣出價": f"{r['sell_p']:.1f} ({sell_pct:+.1f}%)",
+                        "下檔防守價": r["stop_p"],
+                        "大盤MRI": f"{m_i} {r['mri']}",
+                    })
+                except Exception as e:
+                    rows.append({
+                        "標的": tid,
+                        "收盤價": None,
+                        "個股風險": f"失敗({str(e)[:12]})",
+                        "籌碼分": None,
+                        "體質評等": "-",
+                        "建議賣出價": "-",
+                        "下檔防守價": None,
+                        "大盤MRI": "-",
+                    })
+                prog.progress((idx + 1) / len(tickers))
+            prog.empty()
+            status_txt.empty()
+            st.session_state["batch_results"] = pd.DataFrame(rows)
+
+    if "batch_results" in st.session_state and not st.session_state["batch_results"].empty:
+        st.dataframe(st.session_state["batch_results"], use_container_width=True, hide_index=True)
+
+st.markdown(
+    '<div class="disclaimer">本系統所有數據與風險指標皆由公開資訊與量化演算法自動運算產生，僅供風險控管參考，絕非投資買賣建議。<br>投資人應獨立判斷並自負盈虧與法律責任。</div>',
+    unsafe_allow_html=True,
+)
