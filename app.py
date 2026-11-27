@@ -53,15 +53,23 @@ st.markdown(
         margin-top: 12px;
         margin-bottom: 10px;
     }
+    .outlook-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+        gap: 8px;
+        margin-top: 12px;
+        margin-bottom: 10px;
+    }
     .metric-box {
         background-color: #0d1117;
         border: 1px solid #21262d;
         border-radius: 8px;
-        padding: 8px 10px;
+        padding: 9px 10px;
         text-align: center;
     }
     .m-label { font-size: 0.72rem; color: #8b949e; }
     .m-val { font-size: 1.05rem; font-weight: 700; color: #f0f6fc; margin: 2px 0; }
+    .m-note { font-size: 0.68rem; color: #8b949e; margin-bottom: 2px; }
     .m-tag { font-size: 0.7rem; font-weight: 600; }
     .tag-good { color: #3fb950; }
     .tag-mid { color: #e3b341; }
@@ -95,6 +103,16 @@ def get_finmind_token() -> str:
         return st.secrets.get("FINMIND_TOKEN", "").strip()
     except Exception:
         return ""
+
+
+def _safe_float(val) -> Optional[float]:
+    try:
+        if val is None:
+            return None
+        f = float(val)
+        return f if np.isfinite(f) else None
+    except Exception:
+        return None
 
 
 def round_tw_tick(price: float) -> float:
@@ -139,11 +157,12 @@ class GoldenRatioWeights:
     w_commodities: float = 0.120
     w_btc_liquidity: float = 0.100
     w_vix_news: float = 0.162
-    # 第二層：個股風險 (SRI) 權重 — 大盤 40% ＋ 個股（籌碼與體質）60%
+    # 第二層：個股風險 (SRI) 權重 — 大盤 40% ＋ 個股 60%（籌碼 30% / 體質 15% / 未來展望 15%）
     w_mri_transmission: float = 0.400
     w_idiosyncratic: float = 0.600
-    w_stock_chip_in_idio: float = 0.618
-    w_stock_health_in_idio: float = 0.382
+    w_stock_chip_in_idio: float = 0.500
+    w_stock_health_in_idio: float = 0.250
+    w_stock_outlook_in_idio: float = 0.250
 
 
 @dataclass
@@ -166,6 +185,22 @@ class FundamentalQualityReport:
     op_margin_pct: Optional[float] = None
     rev_growth_pct: Optional[float] = None
     source_note: str = "Yahoo"
+    strengths: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ForwardOutlookReport:
+    outlook_score: int                   # 未來展望分數 (10-95，越高越樂觀)
+    risk_equivalent: float               # 換算風險分 (100 - outlook_score)
+    rating: str                          # 強勁看多 / 正向偏多 / 中性觀望 / 動能轉弱 / 保守偏空
+    trailing_pe: Optional[float] = None
+    forward_pe: Optional[float] = None
+    implied_eps_growth_pct: Optional[float] = None
+    target_mean_price: Optional[float] = None
+    target_upside_pct: Optional[float] = None
+    analyst_count: Optional[int] = None
+    rev_accel_pct: Optional[float] = None
     strengths: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -309,156 +344,259 @@ def fetch_shared_market_data(fetch_start: str, end: str, fm_start: str, token: s
     return twii, macro_data, mkt_chips, mkt_status
 
 
-def fetch_fundamentals_smart(clean_id: str, resolved_sym: str, token: str) -> Tuple[FundamentalQualityReport, str]:
+def fetch_fundamentals_and_outlook_smart(
+    clean_id: str, resolved_sym: str, latest_close: float, token: str
+) -> Tuple[FundamentalQualityReport, ForwardOutlookReport, str]:
     """
-    智慧基本面擷取（Yahoo 優先 + FinMind 補齊 PE / PB / 營收年增率）：
-    - 僅在成功抓到至少一項數據時寫入 30 分鐘快取
-    - 若全部為空值（N/A），絕不快取，避免鎖死假資料
+    智慧基本面＋未來展望擷取（Yahoo + FinMind 雙重備援）：
+    - 歷史體質：ROE、營益率、營收年增率、PE、PB
+    - 未來展望：Forward vs Trailing PE、法人目標價空間、近3月 vs 近12月營收加速度
+    - 僅在成功抓到真實數據時快取 30 分鐘；若全為空值絕不快取
     """
-    if "fund_cache" not in st.session_state:
-        st.session_state["fund_cache"] = {}
+    if "fund_outlook_cache" not in st.session_state:
+        st.session_state["fund_outlook_cache"] = {}
 
-    cache_key = f"{clean_id}_{bool(token)}"
-    cached = st.session_state["fund_cache"].get(cache_key)
+    cache_key = f"{clean_id}_{bool(token)}_v84"
+    cached = st.session_state["fund_outlook_cache"].get(cache_key)
     if cached and (time.time() - cached["ts"] < 1800):
-        return cached["quality"], cached["yf_name"]
+        return cached["quality"], cached["outlook"], cached["yf_name"]
 
     pe = pb = roe = op_m = rev_g = None
+    trailing_pe = forward_pe = target_mean = None
+    analyst_cnt = None
+    rev_accel = None
     yf_name = ""
     used_sources = []
 
-    # 1) 優先抓取 Yahoo Finance 基本面
+    # 1) Yahoo Finance 基本面與法人前瞻資料
     try:
         info = yf.Ticker(resolved_sym).info or {}
         yf_name = info.get("shortName") or info.get("longName") or ""
-        pe_raw = info.get("trailingPE") or info.get("forwardPE")
-        pb_raw = info.get("priceToBook")
-        roe_r, op_r, rev_r = info.get("returnOnEquity"), info.get("operatingMargins"), info.get("revenueGrowth")
 
-        pe = round(float(pe_raw), 1) if pe_raw is not None and pd.notna(pe_raw) else None
-        pb = round(float(pb_raw), 2) if pb_raw is not None and pd.notna(pb_raw) else None
-        roe = round(float(roe_r) * 100, 1) if roe_r is not None and pd.notna(roe_r) else None
-        op_m = round(float(op_r) * 100, 1) if op_r is not None and pd.notna(op_r) else None
-        rev_g = round(float(rev_r) * 100, 1) if rev_r is not None and pd.notna(rev_r) else None
+        t_pe = _safe_float(info.get("trailingPE"))
+        f_pe = _safe_float(info.get("forwardPE"))
+        pb_raw = _safe_float(info.get("priceToBook"))
+        roe_r = _safe_float(info.get("returnOnEquity"))
+        op_r = _safe_float(info.get("operatingMargins"))
+        rev_r = _safe_float(info.get("revenueGrowth"))
+        tgt_raw = _safe_float(info.get("targetMeanPrice"))
+        cnt_raw = _safe_float(info.get("numberOfAnalystOpinions"))
 
-        if any(v is not None for v in (pe, pb, roe, op_m, rev_g)):
+        trailing_pe = round(t_pe, 1) if t_pe is not None else None
+        forward_pe = round(f_pe, 1) if f_pe is not None else None
+        pe = trailing_pe if trailing_pe is not None else forward_pe
+        pb = round(pb_raw, 2) if pb_raw is not None else None
+        roe = round(roe_r * 100, 1) if roe_r is not None else None
+        op_m = round(op_r * 100, 1) if op_r is not None else None
+        rev_g = round(rev_r * 100, 1) if rev_r is not None else None
+        target_mean = round(tgt_raw, 1) if (tgt_raw is not None and tgt_raw > 0) else None
+        analyst_cnt = int(cnt_raw) if (cnt_raw is not None and cnt_raw > 0) else None
+
+        if any(v is not None for v in (pe, pb, roe, op_m, rev_g, forward_pe, target_mean)):
             used_sources.append("Yahoo")
     except Exception:
         pass
 
-    # 2) 若 PE / PB 缺漏，改用 FinMind TaiwanStockPER 補齊
     today = datetime.date.today()
     end_str = (today + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 2) FinMind TaiwanStockPER 補齊 PE / PB
     if pe is None or pb is None:
         per_start = (today - datetime.timedelta(days=20)).strftime("%Y-%m-%d")
         df_per, st_per = _finmind_get("TaiwanStockPER", per_start, end_str, token, data_id=clean_id)
         if st_per == "OK" and not df_per.empty:
             latest_per = df_per.sort_values("date").iloc[-1]
-            fm_pe = pd.to_numeric(latest_per.get("PER"), errors="coerce")
-            fm_pb = pd.to_numeric(latest_per.get("PBR"), errors="coerce")
-            if pe is None and pd.notna(fm_pe) and fm_pe > 0:
-                pe = round(float(fm_pe), 1)
+            fm_pe = _safe_float(latest_per.get("PER"))
+            fm_pb = _safe_float(latest_per.get("PBR"))
+            if pe is None and fm_pe is not None and fm_pe > 0:
+                pe = round(fm_pe, 1)
+                if trailing_pe is None:
+                    trailing_pe = pe
                 if "FinMind" not in used_sources:
                     used_sources.append("FinMind")
-            if pb is None and pd.notna(fm_pb) and fm_pb > 0:
-                pb = round(float(fm_pb), 2)
+            if pb is None and fm_pb is not None and fm_pb > 0:
+                pb = round(fm_pb, 2)
                 if "FinMind" not in used_sources:
                     used_sources.append("FinMind")
 
-    # 3) 若營收年增率缺漏，改用 FinMind TaiwanStockMonthRevenue 計算最新單月 YoY
-    if rev_g is None:
-        rev_start = (today - datetime.timedelta(days=460)).strftime("%Y-%m-%d")
-        df_rev, st_rev = _finmind_get("TaiwanStockMonthRevenue", rev_start, end_str, token, data_id=clean_id)
-        if st_rev == "OK" and not df_rev.empty and "revenue" in df_rev.columns:
-            df_rev["revenue"] = pd.to_numeric(df_rev["revenue"], errors="coerce")
-            df_rev = df_rev.dropna(subset=["revenue"]).sort_values(["revenue_year", "revenue_month"])
-            if not df_rev.empty:
-                last_row = df_rev.iloc[-1]
-                ly_year = int(last_row["revenue_year"]) - 1
-                ly_month = int(last_row["revenue_month"])
-                ly_match = df_rev[(df_rev["revenue_year"] == ly_year) & (df_rev["revenue_month"] == ly_month)]
-                if not ly_match.empty:
-                    ly_rev = float(ly_match.iloc[-1]["revenue"])
-                    cur_rev = float(last_row["revenue"])
-                    if ly_rev > 0:
-                        rev_g = round((cur_rev / ly_rev - 1.0) * 100.0, 1)
-                        if "FinMind" not in used_sources:
-                            used_sources.append("FinMind")
+    # 3) FinMind TaiwanStockMonthRevenue：計算「營收動能加速度(3M vs 12M)」並補齊營收年增率
+    rev_start = (today - datetime.timedelta(days=500)).strftime("%Y-%m-%d")
+    df_rev, st_rev = _finmind_get("TaiwanStockMonthRevenue", rev_start, end_str, token, data_id=clean_id)
+    if st_rev == "OK" and not df_rev.empty and "revenue" in df_rev.columns:
+        df_rev["revenue"] = pd.to_numeric(df_rev["revenue"], errors="coerce")
+        df_rev = (
+            df_rev.dropna(subset=["revenue", "revenue_year", "revenue_month"])
+            .sort_values(["revenue_year", "revenue_month"])
+            .drop_duplicates(subset=["revenue_year", "revenue_month"], keep="last")
+        )
+        if len(df_rev) >= 6:
+            avg_3m = float(df_rev["revenue"].tail(3).mean())
+            avg_12m = float(df_rev["revenue"].tail(12).mean())
+            if avg_12m > 0:
+                rev_accel = round((avg_3m / avg_12m - 1.0) * 100.0, 1)
+                if "FinMind" not in used_sources:
+                    used_sources.append("FinMind")
 
-    # 4) 計算財務體質分數與摘要
-    score = 52
-    strengths, warns = [], []
+        if rev_g is None and not df_rev.empty:
+            last_row = df_rev.iloc[-1]
+            ly_match = df_rev[
+                (df_rev["revenue_year"] == int(last_row["revenue_year"]) - 1)
+                & (df_rev["revenue_month"] == int(last_row["revenue_month"]))
+            ]
+            if not ly_match.empty:
+                ly_rev = float(ly_match.iloc[-1]["revenue"])
+                cur_rev = float(last_row["revenue"])
+                if ly_rev > 0:
+                    rev_g = round((cur_rev / ly_rev - 1.0) * 100.0, 1)
+                    if "FinMind" not in used_sources:
+                        used_sources.append("FinMind")
 
+    # 4) 評分 A：歷史財務體質健檢
+    q_score = 52
+    q_strengths, q_warns = [], []
     if roe is not None:
         if roe >= 15.0:
-            score += 14
-            strengths.append(f"股東報酬優異 (ROE {roe}%)")
+            q_score += 14
+            q_strengths.append(f"股東報酬優異 (ROE {roe}%)")
         elif roe >= 8.0:
-            score += 6
-            strengths.append(f"獲利能力穩健 (ROE {roe}%)")
+            q_score += 6
+            q_strengths.append(f"獲利能力穩健 (ROE {roe}%)")
         elif roe < 0:
-            score -= 16
-            warns.append(f"目前處於虧損狀態 (ROE {roe}%)")
+            q_score -= 16
+            q_warns.append(f"目前處於虧損狀態 (ROE {roe}%)")
     if op_m is not None:
         if op_m >= 15.0:
-            score += 10
-            strengths.append(f"本業高毛利護城河 (營益率 {op_m}%)")
+            q_score += 10
+            q_strengths.append(f"本業高毛利護城河 (營益率 {op_m}%)")
         elif op_m < 3.0:
-            score -= 10
-            warns.append(f"本業獲利空間偏薄 (營益率 {op_m}%)")
+            q_score -= 10
+            q_warns.append(f"本業獲利空間偏薄 (營益率 {op_m}%)")
     if rev_g is not None:
         if rev_g >= 15.0:
-            score += 12
-            strengths.append(f"營收高速成長 ({rev_g:+.1f}%)")
+            q_score += 12
+            q_strengths.append(f"營收高速成長 ({rev_g:+.1f}%)")
         elif rev_g >= 5.0:
-            score += 5
+            q_score += 5
         elif rev_g <= -10.0:
-            score -= 12
-            warns.append(f"營收動能明顯衰退 ({rev_g:+.1f}%)")
+            q_score -= 12
+            q_warns.append(f"營收動能明顯衰退 ({rev_g:+.1f}%)")
     if pe is not None:
         if 0 < pe <= 16.0:
-            score += 10
-            strengths.append(f"估值具下檔防禦力 (PE {pe:.1f}x)")
+            q_score += 10
+            q_strengths.append(f"估值具下檔防禦力 (PE {pe:.1f}x)")
         elif pe >= 38.0:
-            score -= 12
-            warns.append(f"本益比偏高，留意估值修正 (PE {pe:.1f}x)")
+            q_score -= 12
+            q_warns.append(f"本益比偏高，留意估值修正 (PE {pe:.1f}x)")
         elif pe < 0:
-            score -= 10
-            warns.append("本益比為負值（虧損）")
+            q_score -= 10
+            q_warns.append("本益比為負值（虧損）")
     if pb is not None and pb >= 6.0:
-        score -= 5
-        warns.append(f"股價淨值比偏高 (PB {pb:.1f}x)")
+        q_score -= 5
+        q_warns.append(f"股價淨值比偏高 (PB {pb:.1f}x)")
 
-    has_any_data = any(v is not None for v in (pe, pb, roe, op_m, rev_g))
-    if not has_any_data:
-        warns.append("暫無財報數據（可能為 ETF 或資料源限流，未寫入快取，可稍後重試）")
+    has_hist = any(v is not None for v in (pe, pb, roe, op_m, rev_g))
+    if not has_hist:
+        q_warns.append("暫無歷史財報數據（可能為 ETF 或資料源限流，未寫入快取）")
 
-    q_score = int(np.clip(score, 10, 95))
-    rating = (
+    q_score = int(np.clip(q_score, 10, 95))
+    q_rating = (
         "A+ 優質核心" if q_score >= 80 else
         "A 穩健優良" if q_score >= 68 else
         "B 中性標準" if q_score >= 52 else
         "C 高估值/轉弱" if q_score >= 38 else "D 體質偏弱"
     )
-    source_note = " + ".join(used_sources) if used_sources else "暫無資料"
-
     quality = FundamentalQualityReport(
-        quality_score=q_score, risk_equivalent=float(100 - q_score), rating=rating,
+        quality_score=q_score, risk_equivalent=float(100 - q_score), rating=q_rating,
         pe=pe, pb=pb, roe_pct=roe, op_margin_pct=op_m, rev_growth_pct=rev_g,
-        source_note=source_note,
-        strengths=strengths if strengths else ["財務結構大致符合產業平均水準"],
-        warnings=warns,
+        source_note=" + ".join(used_sources) if used_sources else "暫無資料",
+        strengths=q_strengths if q_strengths else ["財務結構大致符合產業平均水準"],
+        warnings=q_warns,
     )
 
-    # 關鍵防呆：僅在有真實數據時寫入快取，空值絕不快取
-    if has_any_data:
-        st.session_state["fund_cache"][cache_key] = {
+    # 5) 評分 B：未來展望與法人預期（3 大前瞻因子）
+    o_score = 50
+    o_strengths, o_warns = [], []
+    implied_eps_g = None
+    target_upside = None
+
+    # 因子 1：預估獲利成長 (Trailing PE / Forward PE - 1)
+    if trailing_pe is not None and forward_pe is not None and trailing_pe > 0 and forward_pe > 0:
+        implied_eps_g = round((trailing_pe / forward_pe - 1.0) * 100.0, 1)
+        if implied_eps_g >= 20.0:
+            o_score += 16
+            o_strengths.append(f"預估未來一年獲利高成長 ({implied_eps_g:+.1f}%，Forward PE 降至 {forward_pe}x)")
+        elif implied_eps_g >= 8.0:
+            o_score += 9
+            o_strengths.append(f"預估獲利穩步擴張 ({implied_eps_g:+.1f}%)")
+        elif implied_eps_g <= -10.0:
+            o_score -= 14
+            o_warns.append(f"市場預估獲利恐衰退 ({implied_eps_g:+.1f}%，Forward PE 升至 {forward_pe}x)")
+        elif implied_eps_g <= -3.0:
+            o_score -= 7
+            o_warns.append(f"預估獲利微幅下修 ({implied_eps_g:+.1f}%)")
+
+    # 因子 2：外資／分析師共識目標價空間
+    if target_mean is not None and latest_close > 0:
+        target_upside = round((target_mean / latest_close - 1.0) * 100.0, 1)
+        cnt_txt = f"({analyst_cnt}家機構)" if analyst_cnt else ""
+        if target_upside >= 20.0:
+            o_score += 16
+            o_strengths.append(f"法人共識目標價 {target_mean:.1f} 元{cnt_txt}，潛在空間達 {target_upside:+.1f}%")
+        elif target_upside >= 8.0:
+            o_score += 8
+            o_strengths.append(f"法人目標價 {target_mean:.1f} 元{cnt_txt}，尚有 {target_upside:+.1f}% 空間")
+        elif target_upside <= -10.0:
+            o_score -= 14
+            o_warns.append(f"現價已明顯高於法人目標價 {target_mean:.1f} 元 ({target_upside:+.1f}%)，留意追高")
+        elif target_upside <= -3.0:
+            o_score -= 6
+            o_warns.append(f"現價逼近法人目標價 {target_mean:.1f} 元 ({target_upside:+.1f}%)")
+
+    # 因子 3：營收動能加速度（近 3 月均營收 vs 近 12 月均營收）
+    if rev_accel is not None:
+        if rev_accel >= 15.0:
+            o_score += 16
+            o_strengths.append(f"近 3 月營收動能顯著加速 (較年均 {rev_accel:+.1f}%)")
+        elif rev_accel >= 5.0:
+            o_score += 8
+            o_strengths.append(f"近 3 月營收溫和增溫 (較年均 {rev_accel:+.1f}%)")
+        elif rev_accel <= -12.0:
+            o_score -= 14
+            o_warns.append(f"近 3 月營收動能明顯鈍化 (較年均 {rev_accel:+.1f}%)")
+        elif rev_accel <= -4.0:
+            o_score -= 7
+            o_warns.append(f"近 3 月營收略低於年均 ({rev_accel:+.1f}%)")
+
+    has_outlook = any(v is not None for v in (implied_eps_g, target_upside, rev_accel))
+    if not has_outlook:
+        o_warns.append("目前缺乏外資預估與月營收趨勢資料，展望採中性 50 分基準")
+
+    o_score = int(np.clip(o_score, 10, 95))
+    o_rating = (
+        "強勁看多" if o_score >= 75 else
+        "正向偏多" if o_score >= 60 else
+        "中性觀望" if o_score >= 45 else
+        "動能轉弱" if o_score >= 32 else "保守偏空"
+    )
+    outlook = ForwardOutlookReport(
+        outlook_score=o_score, risk_equivalent=float(100 - o_score), rating=o_rating,
+        trailing_pe=trailing_pe, forward_pe=forward_pe, implied_eps_growth_pct=implied_eps_g,
+        target_mean_price=target_mean, target_upside_pct=target_upside, analyst_count=analyst_cnt,
+        rev_accel_pct=rev_accel,
+        strengths=o_strengths if o_strengths else ["各項前瞻動能指標目前維持中性水準"],
+        warnings=o_warns,
+    )
+
+    # 僅在有真實數據時寫入 30 分鐘快取，空值絕不快取
+    if has_hist or has_outlook:
+        st.session_state["fund_outlook_cache"][cache_key] = {
             "ts": time.time(),
             "quality": quality,
+            "outlook": outlook,
             "yf_name": yf_name,
         }
 
-    return quality, yf_name
+    return quality, outlook, yf_name
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -511,7 +649,7 @@ def fetch_single_stock_price_and_chips(stock_id: str, fetch_start: str, end: str
 
 
 # =========================================================
-# v8.3 核心風控運算引擎（大盤 40% + 個股 60%、樂觀賣出價）
+# v8.4 核心風控運算引擎（大盤 40% + 籌碼 30% + 體質 15% + 展望 15%）
 # =========================================================
 class InstitutionalQuantRiskEngine:
     def __init__(self, config: Optional[RiskModelConfig] = None):
@@ -690,8 +828,8 @@ class InstitutionalQuantRiskEngine:
         return self.cfg.lock_floor_level2 if lock_cnt >= 3 else (self.cfg.lock_floor_level1 if lock_cnt >= 2 else 0.0)
 
     @staticmethod
-    def _calc_prices(sri_score: int, mri_score: int, quality_score: int, row: pd.Series) -> Tuple[float, float]:
-        """樂觀化動態目標價與下檔防守價計算"""
+    def _calc_prices(sri_score: int, mri_score: int, combined_score: int, row: pd.Series) -> Tuple[float, float]:
+        """樂觀化動態目標價與下檔防守價計算（納入體質與未來展望綜合加成）"""
         close_p = float(row["known_stk_close"])
         high_15 = float(row.get("stk_high_15d", close_p))
         atr = float(row.get("stk_atr_14", close_p * 0.025))
@@ -705,7 +843,7 @@ class InstitutionalQuantRiskEngine:
         if pd.isna(high_15) or high_15 < close_p:
             high_15 = close_p
 
-        q_bonus = 0.65 if quality_score >= 75 else (0.20 if quality_score >= 55 else -0.25)
+        q_bonus = 0.70 if combined_score >= 72 else (0.25 if combined_score >= 55 else -0.25)
 
         if sri_score >= 65:
             raw_sell = np.clip(close_p + (1.20 + max(0.0, q_bonus * 0.4)) * eff_atr, close_p * 1.040, close_p * 1.100)
@@ -742,8 +880,12 @@ class InstitutionalQuantRiskEngine:
         if stk.empty or twii.empty:
             raise ValueError(f"查無股票代號「{stock_id}」，請確認是否為有效的台股上市／上櫃代碼。")
 
-        # 智慧基本面查詢（Yahoo + FinMind 雙重備援，空值不快取）
-        quality, yf_name = fetch_fundamentals_smart(clean_id, resolved_sym, token)
+        latest_close_val = float(stk["Close"].dropna().iloc[-1])
+
+        # 智慧基本面＋未來展望查詢（雙重備援，空值不快取）
+        quality, outlook, yf_name = fetch_fundamentals_and_outlook_smart(
+            clean_id, resolved_sym, latest_close_val, token
+        )
         name_map = fetch_tw_stock_name_map(token)
         stock_name = name_map.get(clean_id) or yf_name
         display_name = f"{clean_id}-{stock_name}" if stock_name else clean_id
@@ -828,6 +970,8 @@ class InstitutionalQuantRiskEngine:
         ], dtype=float)
         chip_snaps = np.array([self.score_stock_chips_snapshot(work_df.iloc[i]) for i in range(n)], dtype=float)
 
+        combined_q = int(round(quality.quality_score * 0.5 + outlook.outlook_score * 0.5))
+
         history = []
         w_m, w_c = self.cfg.window_days, self.cfg.chip_smooth_days
         for i in range(max(0, n - lookback_days), n):
@@ -843,13 +987,17 @@ class InstitutionalQuantRiskEngine:
             mri_score = int(np.clip(round(max(wma_10 + trend_adj + persist_adj, self._get_lock_floor(row))), 0, 100))
 
             chip_smooth = float(np.average(c_win, weights=self.chip_weights[-len(c_win):]))
-            idio = chip_smooth * self.w.w_stock_chip_in_idio + quality.risk_equivalent * self.w.w_stock_health_in_idio
+            idio = (
+                chip_smooth * self.w.w_stock_chip_in_idio
+                + quality.risk_equivalent * self.w.w_stock_health_in_idio
+                + outlook.risk_equivalent * self.w.w_stock_outlook_in_idio
+            )
             raw_sri = mri_score * self.w.w_mri_transmission + idio * self.w.w_idiosyncratic
             if chip_smooth > 68.0:
                 raw_sri += min((chip_smooth - 68.0) * 0.45, 10.0)
             sri_score = int(np.clip(round(raw_sri), 0, 100))
 
-            sell_p, stop_p = self._calc_prices(sri_score, mri_score, quality.quality_score, row)
+            sell_p, stop_p = self._calc_prices(sri_score, mri_score, combined_q, row)
             history.append({
                 "date": work_df.index[i],
                 "close": round(float(row["known_stk_close"]), 2),
@@ -873,6 +1021,7 @@ class InstitutionalQuantRiskEngine:
             "sell_p": latest["sell_p"],
             "stop_p": latest["stop_p"],
             "quality": quality,
+            "outlook": outlook,
             "mkt_note": mkt_note,
             "stk_note": stk_note,
             "hist_df": hist_df,
@@ -880,23 +1029,24 @@ class InstitutionalQuantRiskEngine:
 
 
 # =========================================================
-# 清晰版體質分析卡片與 Plotly 深色圖表
+# 卡片渲染：財務體質、未來展望、Plotly 深色圖表
 # =========================================================
-def render_health_card(q: FundamentalQualityReport):
-    def _tag(val, good_cond, bad_cond, good_txt, mid_txt, bad_txt):
-        if val is None or pd.isna(val):
-            return '<span class="m-tag" style="color:#6e7681;">無資料</span>'
-        if good_cond(val):
-            return f'<span class="m-tag tag-good">{good_txt}</span>'
-        if bad_cond(val):
-            return f'<span class="m-tag tag-bad">{bad_txt}</span>'
-        return f'<span class="m-tag tag-mid">{mid_txt}</span>'
+def _metric_tag(val, good_cond, bad_cond, good_txt, mid_txt, bad_txt, empty_txt="無資料"):
+    if val is None or pd.isna(val):
+        return f'<span class="m-tag" style="color:#6e7681;">{empty_txt}</span>'
+    if good_cond(val):
+        return f'<span class="m-tag tag-good">{good_txt}</span>'
+    if bad_cond(val):
+        return f'<span class="m-tag tag-bad">{bad_txt}</span>'
+    return f'<span class="m-tag tag-mid">{mid_txt}</span>'
 
-    roe_t = _tag(q.roe_pct, lambda x: x >= 15, lambda x: x < 5, "優異", "穩健", "偏弱")
-    op_t = _tag(q.op_margin_pct, lambda x: x >= 15, lambda x: x < 3, "高毛利", "普通", "偏薄")
-    rev_t = _tag(q.rev_growth_pct, lambda x: x >= 15, lambda x: x <= -10, "高成長", "平穩", "衰退")
-    pe_t = _tag(q.pe, lambda x: 0 < x <= 16, lambda x: x >= 38 or x < 0, "便宜", "合理", "偏貴/虧損")
-    pb_t = _tag(q.pb, lambda x: 0 < x <= 2.0, lambda x: x >= 6.0, "低估", "合理", "溢價")
+
+def render_health_card(q: FundamentalQualityReport):
+    roe_t = _metric_tag(q.roe_pct, lambda x: x >= 15, lambda x: x < 5, "優異", "穩健", "偏弱")
+    op_t = _metric_tag(q.op_margin_pct, lambda x: x >= 15, lambda x: x < 3, "高毛利", "普通", "偏薄")
+    rev_t = _metric_tag(q.rev_growth_pct, lambda x: x >= 15, lambda x: x <= -10, "高成長", "平穩", "衰退")
+    pe_t = _metric_tag(q.pe, lambda x: 0 < x <= 16, lambda x: x >= 38 or x < 0, "便宜", "合理", "偏貴/虧損")
+    pb_t = _metric_tag(q.pb, lambda x: 0 < x <= 2.0, lambda x: x >= 6.0, "低估", "合理", "溢價")
 
     pb_str = f"{q.pb:.2f}x" if q.pb is not None else "N/A"
     str_html = "".join([f"<div>✅ {s}</div>" for s in q.strengths])
@@ -904,7 +1054,7 @@ def render_health_card(q: FundamentalQualityReport):
 
     st.markdown(
         f"""<div class="risk-card">
-        <div class="card-title">📊 個股財務體質健檢（來源：{q.source_note}）</div>
+        <div class="card-title">📊 個股財務體質健檢（權重 15%｜來源：{q.source_note}）</div>
         <div style="font-size:1.35rem;font-weight:700;color:#f0f6fc;">{q.quality_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{q.rating}】</div>
         <div class="metric-grid">
             <div class="metric-box"><div class="m-label">ROE 報酬率</div><div class="m-val">{_fmt_num(q.roe_pct, '%')}</div>{roe_t}</div>
@@ -912,6 +1062,49 @@ def render_health_card(q: FundamentalQualityReport):
             <div class="metric-box"><div class="m-label">營收年增率</div><div class="m-val">{_fmt_num(q.rev_growth_pct, '%', signed=True)}</div>{rev_t}</div>
             <div class="metric-box"><div class="m-label">本益比 PE</div><div class="m-val">{_fmt_num(q.pe, 'x')}</div>{pe_t}</div>
             <div class="metric-box"><div class="m-label">淨值比 PB</div><div class="m-val">{pb_str}</div>{pb_t}</div>
+        </div>
+        <div class="health-list">{str_html}{warn_html}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_outlook_card(o: ForwardOutlookReport):
+    eps_t = _metric_tag(o.implied_eps_growth_pct, lambda x: x >= 10, lambda x: x <= -5, "看增", "平穩", "看減", "無預估")
+    tgt_t = _metric_tag(o.target_upside_pct, lambda x: x >= 10, lambda x: x <= -5, "具空間", "合理", "偏貴", "無外資追蹤")
+    acc_t = _metric_tag(o.rev_accel_pct, lambda x: x >= 5, lambda x: x <= -5, "加速中", "持平", "鈍化", "無資料")
+
+    pe_sub = f"預估 {o.forward_pe}x / 過去 {o.trailing_pe}x" if (o.forward_pe and o.trailing_pe) else "需雙 PE 數據"
+    tgt_sub = f"目標 {o.target_mean_price:.1f} 元" if o.target_mean_price else "中小型股常見"
+    acc_sub = "近 3 月 vs 近 12 月"
+
+    score_col = "#3fb950" if o.outlook_score >= 60 else ("#ff7b72" if o.outlook_score < 45 else "#e3b341")
+    str_html = "".join([f"<div>🚀 {s}</div>" for s in o.strengths])
+    warn_html = "".join([f"<div>⚠️ {w}</div>" for w in o.warnings]) if o.warnings else ""
+
+    st.markdown(
+        f"""<div class="risk-card">
+        <div class="card-title">🔮 未來展望與法人預期（權重 15%）</div>
+        <div style="font-size:1.35rem;font-weight:700;color:{score_col};">{o.outlook_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{o.rating}】</div>
+        <div class="outlook-grid">
+            <div class="metric-box">
+                <div class="m-label">預估獲利成長</div>
+                <div class="m-val">{_fmt_num(o.implied_eps_growth_pct, '%', signed=True)}</div>
+                <div class="m-note">{pe_sub}</div>
+                {eps_t}
+            </div>
+            <div class="metric-box">
+                <div class="m-label">法人目標空間</div>
+                <div class="m-val">{_fmt_num(o.target_upside_pct, '%', signed=True)}</div>
+                <div class="m-note">{tgt_sub}</div>
+                {tgt_t}
+            </div>
+            <div class="metric-box">
+                <div class="m-label">營收動能加速</div>
+                <div class="m-val">{_fmt_num(o.rev_accel_pct, '%', signed=True)}</div>
+                <div class="m-note">{acc_sub}</div>
+                {acc_t}
+            </div>
         </div>
         <div class="health-list">{str_html}{warn_html}</div>
         </div>""",
@@ -963,7 +1156,10 @@ with st.sidebar:
         key="user_finmind_token",
         help="若遇到免費限流，可至 finmindtrade.com 免費申請 Token 填入。",
     )
-    st.caption("燈號標準：\n🟢 安全 (<48)\n🟡 中等 (48~64)\n🔴 危險 (≥65)\n\n權重配置：大盤環境 40% ＋ 個股籌碼與體質 60%")
+    st.caption(
+        "燈號標準：\n🟢 安全 (<48)\n🟡 中等 (48~64)\n🔴 危險 (≥65)\n\n"
+        "SRI 權重配置：\n大盤環境 40% ＋ 籌碼 30% ＋ 體質 15% ＋ 未來展望 15%"
+    )
 
 
 # =========================================================
@@ -982,7 +1178,7 @@ with tab1:
         run_btn = st.button("一鍵分析", type="primary", use_container_width=True)
 
     if stock_input.strip():
-        with st.spinner(f"正在運算 {stock_input.strip()} 量化風控與體質模型..."):
+        with st.spinner(f"正在運算 {stock_input.strip()} 量化風控、體質與前瞻模型..."):
             try:
                 res = engine.run_analysis(stock_input.strip())
                 m_icon, m_stat, m_col, m_cls = get_traffic_light(res["mri"])
@@ -1035,10 +1231,13 @@ with tab1:
                         unsafe_allow_html=True,
                     )
 
-                # 第三排：清楚的五大指標體質分析卡（標示資料來源）
+                # 第三排：未來展望與法人預期獨立卡片
+                render_outlook_card(res["outlook"])
+
+                # 第四排：歷史財務體質健檢卡
                 render_health_card(res["quality"])
 
-                # 第四排：互動式走勢圖
+                # 第五排：互動式走勢圖
                 render_dark_chart(res)
 
             except Exception as e:
@@ -1072,6 +1271,7 @@ with tab2:
                         "收盤價": r["close"],
                         "個股風險": f"{s_i} {r['sri']} ({s_st})",
                         "籌碼分": r["chip"],
+                        "未來展望": f"{r['outlook'].outlook_score} ({r['outlook'].rating})",
                         "體質評等": f"{r['quality'].quality_score} ({r['quality'].rating.split()[0]})",
                         "建議賣出價": f"{r['sell_p']:.1f} ({sell_pct:+.1f}%)",
                         "下檔防守價": r["stop_p"],
@@ -1083,6 +1283,7 @@ with tab2:
                         "收盤價": None,
                         "個股風險": f"失敗({str(e)[:12]})",
                         "籌碼分": None,
+                        "未來展望": "-",
                         "體質評等": "-",
                         "建議賣出價": "-",
                         "下檔防守價": None,
