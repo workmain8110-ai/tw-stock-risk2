@@ -24,15 +24,20 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 # 頁面基本設定與黑底質感 CSS（手機優先排版）
 # =========================================================
 st.set_page_config(
-    page_title="台股量化風控儀表板 v10",
+    page_title="台股量化風控儀表板 v10.1",
     page_icon="🛡️",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
+def _render_html(html: str):
+    """移除每行前導空白與空行，徹底避免 Streamlit Markdown 將 HTML 誤判為縮排程式碼區塊"""
+    clean = "\n".join(line.strip() for line in html.splitlines() if line.strip())
+    st.markdown(clean, unsafe_allow_html=True)
+
+
 # 自訂深色主題樣式：風險卡片、狀態徽章、四象限標籤、指標網格與免責聲明
-st.markdown(
-    """
+_render_html("""
     <style>
     .stApp { background-color: #0b0e14; color: #e6edf3; }
     .risk-card {
@@ -81,9 +86,7 @@ st.markdown(
     .health-list { font-size: 0.84rem; color: #c9d1d9; margin-top: 6px; line-height: 1.6; }
     .disclaimer { font-size: 0.75rem; color: #6e7681; text-align: center; margin-top: 24px; line-height: 1.5; }
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+    """)
 
 # 內建熱門台股中文名稱備援表（當 API 限流時仍可正確顯示中文）
 FALLBACK_STOCK_NAMES = {
@@ -817,7 +820,7 @@ def fetch_fundamentals_and_outlook_smart(
     """
     if "fund_outlook_cache" not in st.session_state:
         st.session_state["fund_outlook_cache"] = {}
-    cache_key = f"{clean_id}_{bool(token)}_v10"
+    cache_key = f"{clean_id}_{bool(token)}_v101"
     cached = st.session_state["fund_outlook_cache"].get(cache_key)
     if cached and (time.time() - cached["ts"] < 1800):
         return cached["quality"], cached["outlook"], cached["yf_name"]
@@ -968,20 +971,33 @@ def fetch_fundamentals_and_outlook_smart(
         warnings=q_warns,
     )
 
-    # 評分 B：未來展望與法人預期（納入深跌目標價折價防呆）
-    o_score = 48.0
+    # 評分 B：未來展望與法人預期（v10.1 嚴格校準：修正賣方樂觀偏誤、極端值封頂與深跌現實鎖定）
+    o_score = 45.0
     o_strengths, o_warns = [], []
     implied_eps_g = None
     target_upside = None
+    is_deep_pullback = pd.notna(latest_dd_20d) and latest_dd_20d <= -12.0
+    is_severe_crash = pd.notna(latest_dd_20d) and latest_dd_20d <= -15.0
+    strong_eps = strong_tgt = strong_rev = False
 
+    # 因子 1：預估獲利成長 (Trailing PE / Forward PE - 1)
     if trailing_pe is not None and forward_pe is not None and trailing_pe > 0 and forward_pe > 0:
         implied_eps_g = round((trailing_pe / forward_pe - 1.0) * 100.0, 1)
-        if implied_eps_g >= 25.0:
-            o_score += 13.0
+        if implied_eps_g > 150.0:
+            o_score += 8.0
+            strong_eps = True
+            o_strengths.append(f"預估未來一年獲利大幅跳升 ({implied_eps_g:+.1f}%，Forward PE 降至 {forward_pe}x)")
+            o_warns.append(f"預估獲利增幅極端 ({implied_eps_g:+.1f}%)，可能受低基期或預估口徑差異影響（已限制加分上限）")
+        elif implied_eps_g >= 30.0:
+            o_score += 11.0
+            strong_eps = True
             o_strengths.append(f"預估未來一年獲利高成長 ({implied_eps_g:+.1f}%，Forward PE 降至 {forward_pe}x)")
-        elif implied_eps_g >= 10.0:
-            o_score += 7.0
+        elif implied_eps_g >= 15.0:
+            o_score += 6.0
+            strong_eps = True
             o_strengths.append(f"預估獲利穩步擴張 ({implied_eps_g:+.1f}%)")
+        elif implied_eps_g >= 5.0:
+            o_score += 2.0
         elif implied_eps_g <= -10.0:
             o_score -= 14.0
             o_warns.append(f"市場預估獲利恐衰退 ({implied_eps_g:+.1f}%，Forward PE 升至 {forward_pe}x)")
@@ -989,18 +1005,29 @@ def fetch_fundamentals_and_outlook_smart(
             o_score -= 7.0
             o_warns.append(f"預估獲利微幅下修 ({implied_eps_g:+.1f}%)")
 
+    # 因子 2：外資／分析師共識目標價空間（扣除賣方常態樂觀偏誤，深跌時完全不予加分）
     if target_mean is not None and latest_close > 0:
         target_upside = round((target_mean / latest_close - 1.0) * 100.0, 1)
         cnt_txt = f"({analyst_cnt}家機構)" if analyst_cnt else ""
-        is_deep_pullback = pd.notna(latest_dd_20d) and latest_dd_20d <= -12.0
-        if target_upside >= 25.0:
-            o_score += 6.0 if is_deep_pullback else 13.0
+        if target_upside >= 10.0 and is_deep_pullback:
+            o_warns.append(
+                f"法人目標價 {target_mean:.1f} 元{cnt_txt} 雖顯示 {target_upside:+.1f}% 空間，但近月已回檔 {latest_dd_20d:.1f}%，防範滯後下修（暫不計入加分）"
+            )
+        elif target_upside > 80.0:
+            o_score += 6.0
+            strong_tgt = True
+            o_strengths.append(f"法人共識目標價 {target_mean:.1f} 元{cnt_txt}，潛在空間 {target_upside:+.1f}%")
+            o_warns.append("目標價溢價空間異常偏高（>80%），留意報告過時或極端預估（已限制加分）")
+        elif target_upside >= 30.0:
+            o_score += 10.0
+            strong_tgt = True
             o_strengths.append(f"法人共識目標價 {target_mean:.1f} 元{cnt_txt}，潛在空間達 {target_upside:+.1f}%")
-            if is_deep_pullback:
-                o_warns.append(f"近月回檔 {latest_dd_20d:.1f}%，外資目標價恐有滯後風險（已自動折價）")
-        elif target_upside >= 10.0:
-            o_score += 3.0 if is_deep_pullback else 7.0
+        elif target_upside >= 18.0:
+            o_score += 5.0
+            strong_tgt = True
             o_strengths.append(f"法人目標價 {target_mean:.1f} 元{cnt_txt}，尚有 {target_upside:+.1f}% 空間")
+        elif target_upside >= 10.0:
+            o_score += 2.0
         elif target_upside <= -8.0:
             o_score -= 14.0
             o_warns.append(f"現價已明顯高於法人目標價 {target_mean:.1f} 元 ({target_upside:+.1f}%)，留意追高")
@@ -1008,19 +1035,37 @@ def fetch_fundamentals_and_outlook_smart(
             o_score -= 7.0
             o_warns.append(f"現價逼近法人目標價 {target_mean:.1f} 元 ({target_upside:+.1f}%)")
 
+    # 因子 3：營收動能加速度（近 3 月均營收 vs 近 12 月均營收，硬數據維持較高權重）
     if rev_accel is not None:
-        if rev_accel >= 15.0:
-            o_score += 15.0
+        if rev_accel >= 20.0:
+            o_score += 13.0
+            strong_rev = True
             o_strengths.append(f"近 3 月營收動能顯著加速 (較年均 {rev_accel:+.1f}%)")
-        elif rev_accel >= 5.0:
-            o_score += 8.0
+        elif rev_accel >= 10.0:
+            o_score += 7.0
+            strong_rev = True
             o_strengths.append(f"近 3 月營收溫和增溫 (較年均 {rev_accel:+.1f}%)")
+        elif rev_accel >= 4.0:
+            o_score += 3.0
         elif rev_accel <= -12.0:
             o_score -= 14.0
             o_warns.append(f"近 3 月營收動能明顯鈍化 (較年均 {rev_accel:+.1f}%)")
         elif rev_accel <= -4.0:
             o_score -= 7.0
             o_warns.append(f"近 3 月營收略低於年均 ({rev_accel:+.1f}%)")
+
+    # 三因子健康共振加成：唯有三項指標同步達標且股價未深跌才給予共振分數
+    if strong_eps and strong_tgt and strong_rev and pd.notna(latest_dd_20d) and latest_dd_20d > -8.0:
+        o_score += 6.0
+        o_strengths.append("獲利預估、法人目標與營收加速三因子健康共振")
+
+    # 價格重挫現實校準：當股價急殺時，強制壓抑展望分數避免與盤面嚴重脫節
+    if is_severe_crash:
+        o_score = min(o_score - 10.0, 64.0)
+        o_warns.append(f"近月重挫 {latest_dd_20d:.1f}%，價格走勢與基本面預期背離，已強制壓抑展望上限（止穩前不評偏多）")
+    elif is_deep_pullback:
+        o_score = min(o_score - 5.0, 76.0)
+        o_warns.append(f"近月回檔 {latest_dd_20d:.1f}%，趨勢轉弱期間已限縮展望最高評級")
 
     has_outlook = any(v is not None for v in (implied_eps_g, target_upside, rev_accel))
     if not has_outlook:
@@ -1029,10 +1074,10 @@ def fetch_fundamentals_and_outlook_smart(
 
     o_score_int = int(np.clip(round(o_score), 10, 95))
     o_rating = (
-        "強勁看多" if o_score_int >= 75 else
-        "正向偏多" if o_score_int >= 60 else
-        "中性觀望" if o_score_int >= 45 else
-        "動能轉弱" if o_score_int >= 32 else "保守偏空"
+        "強勁看多" if o_score_int >= 82 else
+        "正向偏多" if o_score_int >= 66 else
+        "中性觀望" if o_score_int >= 48 else
+        "動能轉弱" if o_score_int >= 35 else "保守偏空"
     )
     outlook = ForwardOutlookReport(
         outlook_score=o_score_int, risk_equivalent=float(100 - o_score_int), rating=o_rating,
@@ -1641,8 +1686,7 @@ def render_active_alpha_card(aa: ActiveAlphaReport):
     sq_str = f"{aa.vol_squeeze_ratio:.2f}x" if aa.vol_squeeze_ratio is not None else "N/A"
     sig_html = "".join([f"<div>⚡ {s}</div>" for s in aa.signals])
 
-    st.markdown(
-        f"""<div class="risk-card">
+    _render_html(f"""<div class="risk-card">
         <div class="card-title">🎯 主動式進攻因子 (Active Alpha) ＆ 四象限定位</div>
         <div style="display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-top:4px;">
             <span style="font-size:1.45rem;font-weight:700;color:{score_col};">{aa.alpha_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> 【{aa.rating}】</span>
@@ -1670,9 +1714,7 @@ def render_active_alpha_card(aa: ActiveAlphaReport):
             </div>
         </div>
         <div class="health-list">{sig_html}</div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
+        </div>""")
 
 
 def render_advanced_overlay_card(ov: AdvancedRiskOverlay):
@@ -1698,8 +1740,7 @@ def render_advanced_overlay_card(ov: AdvancedRiskOverlay):
             f'{ov.divergence_warning}（風險分 +{ov.divergence_penalty:.0f}）</div>'
         )
 
-    st.markdown(
-        f"""<div class="risk-card">
+    _render_html(f"""<div class="risk-card">
         <div class="card-title">🧠 動態風控引擎偵測（Beta 狀態機 / 風險加速度 / Z-Score 痛點 / 逆風韌性）</div>
         <div style="margin:6px 0 8px 0;">{badges_html}</div>
         {div_html}
@@ -1708,9 +1749,7 @@ def render_advanced_overlay_card(ov: AdvancedRiskOverlay):
         <div>• <b>籌碼痛點 (20日VWAP)：</b>{ov.pain_report.note}</div>
         <div>• <b>逆風韌性 (Downside Alpha)：</b>{ov.downside_alpha.note}</div>
         </div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
+        </div>""")
 
 
 def render_health_card(q: FundamentalQualityReport):
@@ -1723,8 +1762,7 @@ def render_health_card(q: FundamentalQualityReport):
     pb_str = f"{q.pb:.2f}x" if q.pb is not None else "N/A"
     str_html = "".join([f"<div>✅ {s}</div>" for s in q.strengths])
     warn_html = "".join([f"<div>⚠️ {w}</div>" for w in q.warnings]) if q.warnings else "<div>✨ 目前無明顯財務警訊</div>"
-    st.markdown(
-        f"""<div class="risk-card">
+    _render_html(f"""<div class="risk-card">
         <div class="card-title">📊 個股財務體質健檢（來源：{q.source_note}）</div>
         <div style="font-size:1.35rem;font-weight:700;color:#f0f6fc;">{q.quality_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{q.rating}】</div>
         <div class="metric-grid">
@@ -1735,24 +1773,21 @@ def render_health_card(q: FundamentalQualityReport):
         <div class="metric-box"><div class="m-label">淨值比 PB</div><div class="m-val">{pb_str}</div>{pb_t}</div>
         </div>
         <div class="health-list">{str_html}{warn_html}</div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
+        </div>""")
 
 
 def render_outlook_card(o: ForwardOutlookReport):
     """渲染未來展望與法人預期卡片"""
-    eps_t = _metric_tag(o.implied_eps_growth_pct, lambda x: x >= 10, lambda x: x <= -5, "看增", "平穩", "看減", "無預估")
-    tgt_t = _metric_tag(o.target_upside_pct, lambda x: x >= 10, lambda x: x <= -5, "具空間", "合理", "偏貴", "無外資追蹤")
-    acc_t = _metric_tag(o.rev_accel_pct, lambda x: x >= 5, lambda x: x <= -5, "加速中", "持平", "鈍化", "無資料")
+    eps_t = _metric_tag(o.implied_eps_growth_pct, lambda x: x >= 15, lambda x: x <= -5, "看增", "平穩", "看減", "無預估")
+    tgt_t = _metric_tag(o.target_upside_pct, lambda x: x >= 18, lambda x: x <= -5, "具空間", "合理", "偏貴", "無外資追蹤")
+    acc_t = _metric_tag(o.rev_accel_pct, lambda x: x >= 10, lambda x: x <= -5, "加速中", "持平", "鈍化", "無資料")
     pe_sub = f"預估 {o.forward_pe}x / 過去 {o.trailing_pe}x" if (o.forward_pe and o.trailing_pe) else "需雙 PE 數據"
     tgt_sub = f"目標 {o.target_mean_price:.1f} 元" if o.target_mean_price else "中小型股常見"
     acc_sub = "近 3 月 vs 近 12 月"
-    score_col = "#3fb950" if o.outlook_score >= 60 else ("#ff7b72" if o.outlook_score < 45 else "#e3b341")
+    score_col = "#3fb950" if o.outlook_score >= 66 else ("#ff7b72" if o.outlook_score < 48 else "#e3b341")
     str_html = "".join([f"<div>🚀 {s}</div>" for s in o.strengths])
     warn_html = "".join([f"<div>⚠️ {w}</div>" for w in o.warnings]) if o.warnings else ""
-    st.markdown(
-        f"""<div class="risk-card">
+    _render_html(f"""<div class="risk-card">
         <div class="card-title">🔮 未來展望與法人預期</div>
         <div style="font-size:1.35rem;font-weight:700;color:{score_col};">{o.outlook_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{o.rating}】</div>
         <div class="outlook-grid">
@@ -1776,9 +1811,7 @@ def render_outlook_card(o: ForwardOutlookReport):
         </div>
         </div>
         <div class="health-list">{str_html}{warn_html}</div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
+        </div>""")
 
 
 def render_dark_chart(res: Dict):
@@ -1844,7 +1877,7 @@ with st.sidebar:
 # =========================================================
 # 主介面：雙分頁（單股雙軸診斷 / 多股批量掃描）
 # =========================================================
-st.markdown("## 🛡️ 台股量化風控儀表板 v10")
+st.markdown("## 🛡️ 台股量化風控儀表板 v10.1")
 tab1, tab2 = st.tabs(["🔍 單股雙軸診斷", "📋 多股批量掃描"])
 engine = InstitutionalQuantRiskEngine()
 
@@ -1874,50 +1907,38 @@ with tab1:
                 aa = ov.active_alpha
                 mri_weight_pct = int(round(ov.w_mri_dynamic * 100))
 
-                st.markdown(f"### {res['display_name']} &nbsp; <span class='{aa.quadrant_badge_cls}' style='vertical-align:middle;'>{aa.quadrant}</span>", unsafe_allow_html=True)
+                _render_html(f"### {res['display_name']} &nbsp; <span class='{aa.quadrant_badge_cls}' style='vertical-align:middle;'>{aa.quadrant}</span>")
                 st.caption(f"基準日：{res['date']} ｜ 收盤價：{res['close']} 元 ｜ 60日 Beta：{dyn.rolling_beta_60d:.2f} ｜ 籌碼：{res['stk_note']}")
 
                 # 第一排：個股風險 SRI 與大盤風險 MRI（含動態 Beta 權重與風險斜率）
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown(
-                        f"""<div class="risk-card">
+                    _render_html(f"""<div class="risk-card">
                         <div class="card-title">個股風險指數 (SRI)</div>
                         <div class="card-value" style="color:{s_col};">{s_icon} {res['sri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
                         <div class="card-sub"><span class="{s_cls}">{s_stat}</span> 3日斜率 {dyn.sri_velocity_3d:+.1f}｜籌碼 {res['chip']}</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
+                        </div>""")
                 with c2:
-                    st.markdown(
-                        f"""<div class="risk-card">
+                    _render_html(f"""<div class="risk-card">
                         <div class="card-title">大盤風險指數 (MRI)</div>
                         <div class="card-value" style="color:{m_col};">{m_icon} {res['mri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
                         <div class="card-sub"><span class="{m_cls}">{m_stat}</span> Beta權重 {mri_weight_pct}%</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
+                        </div>""")
 
                 # 第二排：動態建議賣出價與下檔防守價
                 c3, c4 = st.columns(2)
                 with c3:
-                    st.markdown(
-                        f"""<div class="risk-card">
+                    _render_html(f"""<div class="risk-card">
                         <div class="card-title">建議賣出價（目標調節區）</div>
                         <div class="card-value" style="color:#d2a8ff;">{res['sell_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
                         <div class="card-sub">距收盤 {sell_pct:+.1f}%</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
+                        </div>""")
                 with c4:
-                    st.markdown(
-                        f"""<div class="risk-card">
+                    _render_html(f"""<div class="risk-card">
                         <div class="card-title">下檔防守價</div>
                         <div class="card-value" style="color:#f0883e;">{res['stop_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
                         <div class="card-sub">距收盤 {stop_pct:+.1f}%</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
+                        </div>""")
 
                 # 第三排：主動式進攻因子與四象限卡片
                 render_active_alpha_card(aa)
@@ -2012,7 +2033,5 @@ with tab2:
         st.dataframe(st.session_state["batch_results"], use_container_width=True, hide_index=True)
 
 # 底部免責聲明
-st.markdown(
-    '<div class="disclaimer">本系統所有數據與風險指標皆由公開資訊與量化演算法自動運算產生，僅供風險控管參考，絕非投資買賣建議。<br>投資人應獨立判斷並自負盈虧與法律責任。</div>',
-    unsafe_allow_html=True,
-)
+_render_html('<div class="disclaimer">本系統所有數據與風險指標皆由公開資訊與量化演算法自動運算產生，僅供風險控管參考，絕非投資買賣建議。<br>投資人應獨立判斷並自負盈虧與法律責任。</div>')
+
