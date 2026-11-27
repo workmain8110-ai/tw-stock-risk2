@@ -524,4 +524,497 @@ class InstitutionalQuantRiskEngine:
                 s_cmd -= 10
         if pd.notna(gold_10d):
             s_cmd += 18 if gold_10d >= 5.0 else (-6 if gold_10d <= -3.0 else 0)
-        s_cmd = float(np.clip(s_cmd,
+        s_cmd = float(np.clip(s_cmd, 10, 100))
+
+        s_btc = 45.0
+        btc_10d = row.get("btc_10d_pct", 0.0)
+        if pd.notna(btc_10d):
+            if btc_10d <= -12.0:
+                s_btc += 35
+            elif btc_10d <= -6.0:
+                s_btc += 18
+            elif btc_10d >= 8.0:
+                s_btc -= 18
+            elif btc_10d >= 4.0:
+                s_btc -= 10
+        s_btc = float(np.clip(s_btc, 10, 100))
+
+        s_vix = 42.0
+        vix, vix_5d = row.get("vix_close", 15.0), row.get("vix_5d_pct", 0.0)
+        if pd.notna(vix):
+            if vix >= 26.0:
+                s_vix += 42
+            elif vix >= 20.0 or (vix >= 16.5 and pd.notna(vix_5d) and vix_5d >= 15.0):
+                s_vix += 22
+            elif vix <= 14.0:
+                s_vix -= 15
+        s_vix = float(np.clip(s_vix, 10, 100))
+        s_sent = s_vix * 0.618 + news_risk_score * 0.382
+
+        mri_snap = (
+            s_us * self.w.w_us_tech + s_rf * self.w.w_rates_fx + s_tw * self.w.w_tw_market
+            + s_cmd * self.w.w_commodities + s_btc * self.w.w_btc_liquidity + s_sent * self.w.w_vix_news
+        )
+        return float(np.clip(mri_snap, 0.0, 100.0))
+
+    @staticmethod
+    def score_stock_chips_snapshot(row: pd.Series) -> float:
+        sm_5d, sm_10d = row.get("smart_5d_vol_ratio", np.nan), row.get("smart_10d_vol_ratio", np.nan)
+        stk_m5, stk_m10 = row.get("margin_5d_chg_pct", np.nan), row.get("margin_10d_chg_pct", np.nan)
+
+        if pd.isna(sm_5d) and pd.isna(stk_m5):
+            cmf, dd_20 = row.get("stk_cmf_10", 0.0), row.get("stk_dd_20d", 0.0)
+            score = 48.0
+            if pd.notna(cmf):
+                score += float(np.clip(-cmf * 75.0, -25.0, 30.0))
+            if pd.notna(dd_20) and dd_20 <= -10.0:
+                score += min(abs(dd_20 + 10.0) * 1.2, 16.0)
+            return float(np.clip(score, 12.0, 92.0))
+
+        score = 45.0
+        m_util, sm_ratio = row.get("margin_util_pct", np.nan), row.get("short_margin_ratio", 0.0)
+        trust_sell, trust_buy = row.get("trust_consec_sell", 0), row.get("trust_consec_buy", 0)
+        trust_prev15 = row.get("trust_prev15_net", 0.0)
+
+        if pd.notna(sm_5d):
+            score += float(np.clip(-sm_5d * 2.1, -22.0, 26.0))
+        if trust_sell >= 3 and trust_prev15 > 0:
+            score += 14
+        elif trust_sell >= 3:
+            score += 8
+        elif trust_buy >= 3:
+            score -= 12
+        if pd.notna(stk_m10) and pd.notna(sm_10d) and stk_m10 >= 4.0 and sm_10d <= -2.0:
+            score += float(np.clip(stk_m10 * 1.2, 6.0, 16.0))
+        if pd.notna(stk_m5) and stk_m5 <= -5.0:
+            if pd.notna(sm_5d) and sm_5d < -1.0:
+                score += 12
+            elif pd.notna(sm_5d) and sm_5d >= 2.5:
+                score -= 14
+        if pd.notna(m_util) and m_util >= 45.0 and pd.notna(sm_5d) and sm_5d < 0:
+            score += 8
+        if pd.notna(sm_ratio) and sm_ratio >= 18.0:
+            score -= 8
+        return float(np.clip(score, 8.0, 98.0))
+
+    def _get_lock_floor(self, row: pd.Series) -> float:
+        lock_cnt = 0
+        f_5d, f_10d = row.get("mkt_foreign_5d_b", np.nan), row.get("mkt_foreign_10d_b", np.nan)
+        if pd.notna(f_5d):
+            if f_5d <= -180 or (f_5d < 0 and pd.notna(f_10d) and f_10d <= -450):
+                lock_cnt += 1
+        elif row.get("twii_below_ma240", 0) == 1:
+            lock_cnt += 1
+        tnx, vix = row.get("tnx_close", np.nan), row.get("vix_close", np.nan)
+        if (pd.notna(tnx) and tnx >= 5.00) or (pd.notna(vix) and vix >= 22.0):
+            lock_cnt += 1
+        hv, dd = row.get("twii_hv_20", 0.0), row.get("twii_dd_60d", 0.0)
+        if (pd.notna(hv) and hv >= 24.0) or (pd.notna(dd) and dd <= -10.0 and (pd.isna(f_5d) or f_5d < 100)):
+            lock_cnt += 1
+        return self.cfg.lock_floor_level2 if lock_cnt >= 3 else (self.cfg.lock_floor_level1 if lock_cnt >= 2 else 0.0)
+
+    @staticmethod
+    def _calc_prices(sri_score: int, mri_score: int, quality_score: int, row: pd.Series) -> Tuple[float, float]:
+        """樂觀化動態目標價與下檔防守價計算"""
+        close_p = float(row["known_stk_close"])
+        high_15 = float(row.get("stk_high_15d", close_p))
+        atr = float(row.get("stk_atr_14", close_p * 0.025))
+        vwap_20 = float(row.get("stk_vwap_20", close_p))
+
+        if pd.isna(atr) or atr <= 0:
+            atr = close_p * 0.025
+        eff_atr = min(atr, close_p * 0.065)
+        if pd.isna(vwap_20) or vwap_20 <= 0:
+            vwap_20 = close_p
+        if pd.isna(high_15) or high_15 < close_p:
+            high_15 = close_p
+
+        q_bonus = 0.65 if quality_score >= 75 else (0.20 if quality_score >= 55 else -0.25)
+
+        if sri_score >= 65:
+            raw_sell = np.clip(close_p + (1.20 + max(0.0, q_bonus * 0.4)) * eff_atr, close_p * 1.040, close_p * 1.100)
+            raw_stop = np.clip(close_p - 1.15 * eff_atr, close_p * 0.930, close_p * 0.970)
+        elif sri_score >= 48:
+            raw_sell = close_p + (1.85 + max(0.0, q_bonus * 0.7)) * eff_atr
+            if close_p < vwap_20 <= close_p * 1.14 and mri_score >= 65:
+                raw_sell = max(raw_sell, vwap_20 * 1.01)
+            raw_sell = np.clip(raw_sell, close_p * 1.070, close_p * 1.160)
+            raw_stop = np.clip(min(high_15 - 1.90 * eff_atr, close_p - 1.45 * eff_atr), close_p * 0.905, close_p * 0.960)
+        else:
+            raw_sell = np.clip(close_p + (2.80 + q_bonus) * eff_atr, close_p * 1.120, close_p * 1.250)
+            raw_stop = np.clip(min(high_15 - 2.65 * eff_atr, close_p - 1.90 * eff_atr), close_p * 0.875, close_p * 0.945)
+
+        sell_p = round_tw_tick(float(raw_sell))
+        stop_p = round_tw_tick(float(raw_stop))
+        if sell_p <= close_p:
+            sell_p = round_tw_tick(close_p * 1.03)
+        if stop_p >= close_p:
+            stop_p = round_tw_tick(close_p * 0.97)
+        return sell_p, stop_p
+
+    def run_analysis(self, stock_id: str, lookback_days: int = 75, fast_batch: bool = False) -> Dict:
+        today = datetime.date.today()
+        fetch_start = (today - datetime.timedelta(days=450)).strftime("%Y-%m-%d")
+        fm_start = (today - datetime.timedelta(days=180)).strftime("%Y-%m-%d")
+        end_str = (today + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        token = get_finmind_token()
+
+        twii, macro_data, mkt_chips, mkt_status = fetch_shared_market_data(fetch_start, end_str, fm_start, token)
+        stk, resolved_sym, display_name, quality, stk_chips, stk_status = fetch_single_stock_bundle(
+            stock_id, fetch_start, end_str, fm_start, token
+        )
+        if stk.empty or twii.empty:
+            raise ValueError(f"查無股票代號「{stock_id}」，請確認是否為有效的台股上市／上櫃代碼。")
+
+        live_news = fetch_news_risk_score("") if fast_batch else fetch_news_risk_score(stock_id)
+        mkt_note = "真實籌碼" if not mkt_chips.empty else f"備援({mkt_status})"
+        stk_note = "真實籌碼" if not stk_chips.empty else f"資金流代理({stk_status})"
+
+        df = pd.DataFrame(index=twii.index)
+        twii_c = twii["Close"]
+        stk_h = stk["High"].reindex(df.index).ffill()
+        stk_l = stk["Low"].reindex(df.index).ffill()
+        stk_c = stk["Close"].reindex(df.index).ffill()
+        stk_v = stk["Volume"].reindex(df.index).ffill()
+
+        twii_ma60 = twii_c.rolling(60).mean()
+        twii_ma240 = twii_c.rolling(240, min_periods=120).mean()
+        df["twii_bias_60"] = (twii_c / twii_ma60 - 1) * 100
+        df["twii_below_ma60"] = (twii_c < twii_ma60).astype(int)
+        df["twii_below_ma240"] = (twii_c < twii_ma240).astype(int)
+        df["twii_hv_20"] = twii_c.pct_change().rolling(20).std() * np.sqrt(252) * 100
+        df["twii_dd_60d"] = (twii_c / twii_c.rolling(60, min_periods=10).max() - 1) * 100
+
+        prev_c = stk_c.shift(1)
+        tr = pd.concat([(stk_h - stk_l), (stk_h - prev_c).abs(), (stk_l - prev_c).abs()], axis=1).max(axis=1)
+        df["stk_atr_14"] = tr.rolling(14).mean()
+        df["stk_high_15d"] = stk_h.rolling(15).max()
+        df["stk_vwap_20"] = (stk_c * stk_v).rolling(20).sum() / stk_v.rolling(20).sum().replace(0, np.nan)
+
+        hl_range = (stk_h - stk_l).replace(0, np.nan)
+        mfm = (((stk_c - stk_l) - (stk_h - stk_c)) / hl_range).fillna(0.0)
+        df["stk_cmf_10"] = (mfm * stk_v).rolling(10).sum() / stk_v.rolling(10).sum().replace(0, np.nan)
+        df["stk_dd_20d"] = (stk_c / stk_c.rolling(20, min_periods=5).max() - 1) * 100
+
+        def align(k: str) -> pd.Series:
+            return pd.Series(np.nan, index=df.index) if macro_data[k].empty else macro_data[k]["Close"].reindex(df.index, method="ffill")
+
+        sox, ndx, tnx = align("SOX"), align("NDX"), align("TNX")
+        df["sox_5d_pct"], df["sox_10d_pct"] = sox.pct_change(5) * 100, sox.pct_change(10) * 100
+        df["ndx_5d_pct"], df["ndx_10d_pct"] = ndx.pct_change(5) * 100, ndx.pct_change(10) * 100
+        df["tnx_close"], df["tnx_20d_chg"] = tnx, tnx - tnx.shift(20)
+        df["usdtwd_10d_pct"] = align("USDTWD").pct_change(10) * 100
+        df["gold_10d_pct"] = align("GOLD").pct_change(10) * 100
+        oil = align("OIL")
+        df["oil_close"], df["oil_10d_pct"] = oil, oil.pct_change(10) * 100
+        df["btc_10d_pct"] = align("BTC").pct_change(10) * 100
+        vix = align("VIX")
+        df["vix_close"], df["vix_5d_pct"] = vix, vix.pct_change(5) * 100
+
+        if not mkt_chips.empty:
+            mc = mkt_chips.reindex(df.index).ffill()
+            if "mkt_margin_bal" in mc:
+                df["mkt_margin_rank_60d"] = mc["mkt_margin_bal"].rolling(60, min_periods=20).rank(pct=True)
+                df["mkt_margin_5d_pct"] = mc["mkt_margin_bal"].pct_change(5) * 100
+            if "mkt_foreign_net_b" in mc:
+                df["mkt_foreign_5d_b"] = mc["mkt_foreign_net_b"].rolling(5).sum()
+                df["mkt_foreign_10d_b"] = mc["mkt_foreign_net_b"].rolling(10).sum()
+
+        if not stk_chips.empty:
+            sc = stk_chips.reindex(df.index).ffill()
+            if "margin_bal" in sc:
+                df["margin_5d_chg_pct"] = sc["margin_bal"].pct_change(5) * 100
+                df["margin_10d_chg_pct"] = sc["margin_bal"].pct_change(10) * 100
+                df["margin_util_pct"] = sc.get("margin_util_pct", np.nan)
+                df["short_margin_ratio"] = sc.get("short_margin_ratio", 0.0)
+            if "smart_money_net" in sc:
+                v5, v10 = stk_v.rolling(5).sum().replace(0, np.nan), stk_v.rolling(10).sum().replace(0, np.nan)
+                df["smart_5d_vol_ratio"] = (sc["smart_money_net"].rolling(5).sum() / v5) * 100
+                df["smart_10d_vol_ratio"] = (sc["smart_money_net"].rolling(10).sum() / v10) * 100
+                is_sell, is_buy = (sc["trust_net"] < 0).astype(int), (sc["trust_net"] > 0).astype(int)
+                df["trust_consec_sell"] = np.where(is_sell == 1, is_sell.groupby((is_sell != is_sell.shift()).cumsum()).cumsum(), 0)
+                df["trust_consec_buy"] = np.where(is_buy == 1, is_buy.groupby((is_buy != is_buy.shift()).cumsum()).cumsum(), 0)
+                df["trust_prev15_net"] = sc["trust_net"].shift(3).rolling(15).sum()
+
+        work_df = df.dropna(subset=["stk_atr_14"]).tail(lookback_days + 15).copy()
+        work_df["known_stk_close"] = stk_c.reindex(work_df.index)
+        n = len(work_df)
+
+        mri_snaps = np.array([
+            self.score_market_snapshot(work_df.iloc[i], news_risk_score=(live_news if i == n - 1 else 50.0))
+            for i in range(n)
+        ], dtype=float)
+        chip_snaps = np.array([self.score_stock_chips_snapshot(work_df.iloc[i]) for i in range(n)], dtype=float)
+
+        history = []
+        w_m, w_c = self.cfg.window_days, self.cfg.chip_smooth_days
+        for i in range(max(0, n - lookback_days), n):
+            m_win = mri_snaps[max(0, i - w_m + 1) : i + 1]
+            c_win = chip_snaps[max(0, i - w_c + 1) : i + 1]
+            row = work_df.iloc[i]
+
+            wma_10 = float(np.average(m_win, weights=self.mri_weights[-len(m_win):]))
+            mom = float(np.mean(m_win[-3:]) - np.mean(m_win[:-3])) if len(m_win) >= 6 else 0.0
+            trend_adj = min(mom * 0.45, 13.0) if mom >= 5.0 else (max(mom * 0.20, -6.0) if mom <= -7.0 else 0.0)
+            high_days = int(np.sum(m_win >= 65.0))
+            persist_adj = 7.0 if high_days >= 7 else (3.5 if high_days >= 5 else 0.0)
+            mri_score = int(np.clip(round(max(wma_10 + trend_adj + persist_adj, self._get_lock_floor(row))), 0, 100))
+
+            chip_smooth = float(np.average(c_win, weights=self.chip_weights[-len(c_win):]))
+            idio = chip_smooth * self.w.w_stock_chip_in_idio + quality.risk_equivalent * self.w.w_stock_health_in_idio
+            raw_sri = mri_score * self.w.w_mri_transmission + idio * self.w.w_idiosyncratic
+            if chip_smooth > 68.0:
+                raw_sri += min((chip_smooth - 68.0) * 0.45, 10.0)
+            sri_score = int(np.clip(round(raw_sri), 0, 100))
+
+            sell_p, stop_p = self._calc_prices(sri_score, mri_score, quality.quality_score, row)
+            history.append({
+                "date": work_df.index[i],
+                "close": round(float(row["known_stk_close"]), 2),
+                "mri": mri_score,
+                "sri": sri_score,
+                "chip": int(round(chip_smooth)),
+                "sell_p": sell_p,
+                "stop_p": stop_p,
+            })
+
+        hist_df = pd.DataFrame(history).set_index("date")
+        latest = history[-1]
+        return {
+            "symbol": resolved_sym,
+            "display_name": display_name,
+            "date": latest["date"].strftime("%Y-%m-%d"),
+            "close": latest["close"],
+            "mri": latest["mri"],
+            "sri": latest["sri"],
+            "chip": latest["chip"],
+            "sell_p": latest["sell_p"],
+            "stop_p": latest["stop_p"],
+            "quality": quality,
+            "mkt_note": mkt_note,
+            "stk_note": stk_note,
+            "hist_df": hist_df,
+        }
+
+
+# =========================================================
+# 清晰版體質分析卡片與 Plotly 深色圖表
+# =========================================================
+def render_health_card(q: FundamentalQualityReport):
+    def _tag(val, good_cond, bad_cond, good_txt, mid_txt, bad_txt):
+        if val is None or pd.isna(val):
+            return '<span class="m-tag" style="color:#6e7681;">無資料</span>'
+        if good_cond(val):
+            return f'<span class="m-tag tag-good">{good_txt}</span>'
+        if bad_cond(val):
+            return f'<span class="m-tag tag-bad">{bad_txt}</span>'
+        return f'<span class="m-tag tag-mid">{mid_txt}</span>'
+
+    roe_t = _tag(q.roe_pct, lambda x: x >= 15, lambda x: x < 5, "優異", "穩健", "偏弱")
+    op_t = _tag(q.op_margin_pct, lambda x: x >= 15, lambda x: x < 3, "高毛利", "普通", "偏薄")
+    rev_t = _tag(q.rev_growth_pct, lambda x: x >= 15, lambda x: x <= -10, "高成長", "平穩", "衰退")
+    pe_t = _tag(q.pe, lambda x: 0 < x <= 16, lambda x: x >= 38 or x < 0, "便宜", "合理", "偏貴/虧損")
+    pb_t = _tag(q.pb, lambda x: 0 < x <= 2.0, lambda x: x >= 6.0, "低估", "合理", "溢價")
+
+    pb_str = f"{q.pb:.2f}x" if q.pb is not None else "N/A"
+    str_html = "".join([f"<div>✅ {s}</div>" for s in q.strengths])
+    warn_html = "".join([f"<div>⚠️ {w}</div>" for w in q.warnings]) if q.warnings else "<div>✨ 目前無明顯財務警訊</div>"
+
+    st.markdown(
+        f"""<div class="risk-card">
+        <div class="card-title">📊 個股財務體質健檢</div>
+        <div style="font-size:1.35rem;font-weight:700;color:#f0f6fc;">{q.quality_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{q.rating}】</div>
+        <div class="metric-grid">
+            <div class="metric-box"><div class="m-label">ROE 報酬率</div><div class="m-val">{_fmt_num(q.roe_pct, '%')}</div>{roe_t}</div>
+            <div class="metric-box"><div class="m-label">營業利益率</div><div class="m-val">{_fmt_num(q.op_margin_pct, '%')}</div>{op_t}</div>
+            <div class="metric-box"><div class="m-label">營收年增率</div><div class="m-val">{_fmt_num(q.rev_growth_pct, '%', signed=True)}</div>{rev_t}</div>
+            <div class="metric-box"><div class="m-label">本益比 PE</div><div class="m-val">{_fmt_num(q.pe, 'x')}</div>{pe_t}</div>
+            <div class="metric-box"><div class="m-label">淨值比 PB</div><div class="m-val">{pb_str}</div>{pb_t}</div>
+        </div>
+        <div class="health-list">{str_html}{warn_html}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_dark_chart(res: Dict):
+    df = res["hist_df"]
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07, row_heights=[0.62, 0.38]
+    )
+
+    fig.add_trace(go.Scatter(x=df.index, y=df["close"], name="收盤價", line=dict(color="#58a6ff", width=2.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["sell_p"], name="建議賣出價", line=dict(color="#d2a8ff", width=1.5, dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["stop_p"], name="下檔防守價", line=dict(color="#f0883e", width=1.6, dash="dash")), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=df.index, y=df["mri"], name="大盤風險 (MRI)", line=dict(color="#ff7b72", width=2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["sri"], name="個股風險 (SRI)", line=dict(color="#3fb950", width=2, dash="dash")), row=2, col=1)
+
+    fig.add_hrect(y0=65, y1=100, fillcolor="rgba(255,123,114,0.12)", line_width=0, row=2, col=1)
+    fig.add_hrect(y0=0, y1=48, fillcolor="rgba(63,185,80,0.10)", line_width=0, row=2, col=1)
+    fig.add_hline(y=65, line_dash="dot", line_color="#ff7b72", opacity=0.7, row=2, col=1)
+    fig.add_hline(y=48, line_dash="dot", line_color="#3fb950", opacity=0.7, row=2, col=1)
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0b0e14",
+        plot_bgcolor="#161b22",
+        height=520,
+        margin=dict(l=10, r=10, t=35, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)),
+        hovermode="x unified",
+    )
+    fig.update_yaxes(title_text="股價", gridcolor="#30363d", row=1, col=1)
+    fig.update_yaxes(title_text="風險分", range=[0, 102], gridcolor="#30363d", row=2, col=1)
+    fig.update_xaxes(gridcolor="#30363d")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+# =========================================================
+# 側邊欄：FinMind Token 設定（選填）
+# =========================================================
+with st.sidebar:
+    st.markdown("### ⚙️ 系統連線設定")
+    st.text_input(
+        "FinMind API Token（選填）",
+        type="password",
+        key="user_finmind_token",
+        help="若遇到免費限流，可至 finmindtrade.com 免費申請 Token 填入。",
+    )
+    st.caption("燈號標準：\n🟢 安全 (<48)\n🟡 中等 (48~64)\n🔴 危險 (≥65)\n\n權重配置：大盤環境 40% ＋ 個股籌碼與體質 60%")
+
+
+# =========================================================
+# 主介面：雙分頁（單股一鍵查閱 / 多股批量掃描）
+# =========================================================
+st.markdown("## 🛡️ 台股量化風控儀表板")
+tab1, tab2 = st.tabs(["🔍 單股風控診斷", "📋 多股批量掃描"])
+
+engine = InstitutionalQuantRiskEngine()
+
+with tab1:
+    col_in, col_btn = st.columns([3, 1.2])
+    with col_in:
+        stock_input = st.text_input("輸入台股代號（上市／上櫃自動偵測）", value="2330", placeholder="例如 2330、2382、6274", label_visibility="collapsed")
+    with col_btn:
+        run_btn = st.button("一鍵分析", type="primary", use_container_width=True)
+
+    if stock_input.strip():
+        with st.spinner(f"正在運算 {stock_input.strip()} 量化風控與體質模型..."):
+            try:
+                res = engine.run_analysis(stock_input.strip())
+                m_icon, m_stat, m_col, m_cls = get_traffic_light(res["mri"])
+                s_icon, s_stat, s_col, s_cls = get_traffic_light(res["sri"])
+                sell_pct = (res["sell_p"] / res["close"] - 1) * 100
+                stop_pct = (res["stop_p"] / res["close"] - 1) * 100
+
+                st.markdown(f"### {res['display_name']}")
+                st.caption(f"基準日：{res['date']} ｜ 收盤價：{res['close']} 元 ｜ 籌碼：{res['stk_note']}")
+
+                # 第一排：個股風險 vs 大盤風險
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown(
+                        f"""<div class="risk-card">
+                        <div class="card-title">個股風險指數 (SRI)</div>
+                        <div class="card-value" style="color:{s_col};">{s_icon} {res['sri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
+                        <div class="card-sub"><span class="{s_cls}">{s_stat}</span> &nbsp;籌碼風險 {res['chip']}/100</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                with c2:
+                    st.markdown(
+                        f"""<div class="risk-card">
+                        <div class="card-title">大盤風險指數 (MRI)</div>
+                        <div class="card-value" style="color:{m_col};">{m_icon} {res['mri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
+                        <div class="card-sub"><span class="{m_cls}">{m_stat}</span> &nbsp;佔比權重 40%</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+
+                # 第二排：動態價位卡
+                c3, c4 = st.columns(2)
+                with c3:
+                    st.markdown(
+                        f"""<div class="risk-card">
+                        <div class="card-title">建議賣出價（目標調節區）</div>
+                        <div class="card-value" style="color:#d2a8ff;">{res['sell_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
+                        <div class="card-sub">距收盤 {sell_pct:+.1f}%</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+                with c4:
+                    st.markdown(
+                        f"""<div class="risk-card">
+                        <div class="card-title">下檔防守價</div>
+                        <div class="card-value" style="color:#f0883e;">{res['stop_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
+                        <div class="card-sub">距收盤 {stop_pct:+.1f}%</div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
+
+                # 第三排：清楚的五大指標體質分析卡
+                render_health_card(res["quality"])
+
+                # 第四排：互動式走勢圖
+                render_dark_chart(res)
+
+            except Exception as e:
+                st.error(f"分析失敗：{e}")
+
+with tab2:
+    batch_input = st.text_area(
+        "輸入多檔代號（支援逗號、空白或換行分隔）",
+        value="2330, 2454, 2382, 6274, 2881",
+        height=72,
+    )
+    if st.button("開始批量掃描", type="primary", use_container_width=True):
+        raw_tokens = re.split(r"[,，\s\n]+", batch_input.strip())
+        tickers = list(dict.fromkeys([t.strip().upper() for t in raw_tokens if t.strip()]))
+
+        if not tickers:
+            st.warning("請先輸入至少一檔台股代號。")
+        else:
+            rows = []
+            prog = st.progress(0)
+            status_txt = st.empty()
+            for idx, tid in enumerate(tickers):
+                status_txt.caption(f"正在掃描 ({idx + 1}/{len(tickers)})：{tid} ...")
+                try:
+                    r = engine.run_analysis(tid, lookback_days=20, fast_batch=True)
+                    m_i, _, _, _ = get_traffic_light(r["mri"])
+                    s_i, s_st, _, _ = get_traffic_light(r["sri"])
+                    sell_pct = (r["sell_p"] / r["close"] - 1) * 100
+                    rows.append({
+                        "標的": r["display_name"],
+                        "收盤價": r["close"],
+                        "個股風險": f"{s_i} {r['sri']} ({s_st})",
+                        "籌碼分": r["chip"],
+                        "體質評等": f"{r['quality'].quality_score} ({r['quality'].rating.split()[0]})",
+                        "建議賣出價": f"{r['sell_p']:.1f} ({sell_pct:+.1f}%)",
+                        "下檔防守價": r["stop_p"],
+                        "大盤MRI": f"{m_i} {r['mri']}",
+                    })
+                except Exception as e:
+                    rows.append({
+                        "標的": tid,
+                        "收盤價": None,
+                        "個股風險": f"失敗({str(e)[:12]})",
+                        "籌碼分": None,
+                        "體質評等": "-",
+                        "建議賣出價": "-",
+                        "下檔防守價": None,
+                        "大盤MRI": "-",
+                    })
+                prog.progress((idx + 1) / len(tickers))
+            prog.empty()
+            status_txt.empty()
+            st.session_state["batch_results"] = pd.DataFrame(rows)
+
+    if "batch_results" in st.session_state and not st.session_state["batch_results"].empty:
+        st.dataframe(st.session_state["batch_results"], use_container_width=True, hide_index=True)
+
+st.markdown(
+    '<div class="disclaimer">本系統所有數據與風險指標皆由公開資訊與量化演算法自動運算產生，僅供風險控管參考，絕非投資買賣建議。<br>投資人應獨立判斷並自負盈虧與法律責任。</div>',
+    unsafe_allow_html=True,
+)
