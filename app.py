@@ -1,6 +1,7 @@
 import datetime
 import logging
 import re
+import time
 import urllib.parse
 import warnings
 import xml.etree.ElementTree as ET
@@ -164,6 +165,7 @@ class FundamentalQualityReport:
     roe_pct: Optional[float] = None
     op_margin_pct: Optional[float] = None
     rev_growth_pct: Optional[float] = None
+    source_note: str = "Yahoo"
     strengths: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -307,8 +309,161 @@ def fetch_shared_market_data(fetch_start: str, end: str, fm_start: str, token: s
     return twii, macro_data, mkt_chips, mkt_status
 
 
+def fetch_fundamentals_smart(clean_id: str, resolved_sym: str, token: str) -> Tuple[FundamentalQualityReport, str]:
+    """
+    智慧基本面擷取（Yahoo 優先 + FinMind 補齊 PE / PB / 營收年增率）：
+    - 僅在成功抓到至少一項數據時寫入 30 分鐘快取
+    - 若全部為空值（N/A），絕不快取，避免鎖死假資料
+    """
+    if "fund_cache" not in st.session_state:
+        st.session_state["fund_cache"] = {}
+
+    cache_key = f"{clean_id}_{bool(token)}"
+    cached = st.session_state["fund_cache"].get(cache_key)
+    if cached and (time.time() - cached["ts"] < 1800):
+        return cached["quality"], cached["yf_name"]
+
+    pe = pb = roe = op_m = rev_g = None
+    yf_name = ""
+    used_sources = []
+
+    # 1) 優先抓取 Yahoo Finance 基本面
+    try:
+        info = yf.Ticker(resolved_sym).info or {}
+        yf_name = info.get("shortName") or info.get("longName") or ""
+        pe_raw = info.get("trailingPE") or info.get("forwardPE")
+        pb_raw = info.get("priceToBook")
+        roe_r, op_r, rev_r = info.get("returnOnEquity"), info.get("operatingMargins"), info.get("revenueGrowth")
+
+        pe = round(float(pe_raw), 1) if pe_raw is not None and pd.notna(pe_raw) else None
+        pb = round(float(pb_raw), 2) if pb_raw is not None and pd.notna(pb_raw) else None
+        roe = round(float(roe_r) * 100, 1) if roe_r is not None and pd.notna(roe_r) else None
+        op_m = round(float(op_r) * 100, 1) if op_r is not None and pd.notna(op_r) else None
+        rev_g = round(float(rev_r) * 100, 1) if rev_r is not None and pd.notna(rev_r) else None
+
+        if any(v is not None for v in (pe, pb, roe, op_m, rev_g)):
+            used_sources.append("Yahoo")
+    except Exception:
+        pass
+
+    # 2) 若 PE / PB 缺漏，改用 FinMind TaiwanStockPER 補齊
+    today = datetime.date.today()
+    end_str = (today + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    if pe is None or pb is None:
+        per_start = (today - datetime.timedelta(days=20)).strftime("%Y-%m-%d")
+        df_per, st_per = _finmind_get("TaiwanStockPER", per_start, end_str, token, data_id=clean_id)
+        if st_per == "OK" and not df_per.empty:
+            latest_per = df_per.sort_values("date").iloc[-1]
+            fm_pe = pd.to_numeric(latest_per.get("PER"), errors="coerce")
+            fm_pb = pd.to_numeric(latest_per.get("PBR"), errors="coerce")
+            if pe is None and pd.notna(fm_pe) and fm_pe > 0:
+                pe = round(float(fm_pe), 1)
+                if "FinMind" not in used_sources:
+                    used_sources.append("FinMind")
+            if pb is None and pd.notna(fm_pb) and fm_pb > 0:
+                pb = round(float(fm_pb), 2)
+                if "FinMind" not in used_sources:
+                    used_sources.append("FinMind")
+
+    # 3) 若營收年增率缺漏，改用 FinMind TaiwanStockMonthRevenue 計算最新單月 YoY
+    if rev_g is None:
+        rev_start = (today - datetime.timedelta(days=460)).strftime("%Y-%m-%d")
+        df_rev, st_rev = _finmind_get("TaiwanStockMonthRevenue", rev_start, end_str, token, data_id=clean_id)
+        if st_rev == "OK" and not df_rev.empty and "revenue" in df_rev.columns:
+            df_rev["revenue"] = pd.to_numeric(df_rev["revenue"], errors="coerce")
+            df_rev = df_rev.dropna(subset=["revenue"]).sort_values(["revenue_year", "revenue_month"])
+            if not df_rev.empty:
+                last_row = df_rev.iloc[-1]
+                ly_year = int(last_row["revenue_year"]) - 1
+                ly_month = int(last_row["revenue_month"])
+                ly_match = df_rev[(df_rev["revenue_year"] == ly_year) & (df_rev["revenue_month"] == ly_month)]
+                if not ly_match.empty:
+                    ly_rev = float(ly_match.iloc[-1]["revenue"])
+                    cur_rev = float(last_row["revenue"])
+                    if ly_rev > 0:
+                        rev_g = round((cur_rev / ly_rev - 1.0) * 100.0, 1)
+                        if "FinMind" not in used_sources:
+                            used_sources.append("FinMind")
+
+    # 4) 計算財務體質分數與摘要
+    score = 52
+    strengths, warns = [], []
+
+    if roe is not None:
+        if roe >= 15.0:
+            score += 14
+            strengths.append(f"股東報酬優異 (ROE {roe}%)")
+        elif roe >= 8.0:
+            score += 6
+            strengths.append(f"獲利能力穩健 (ROE {roe}%)")
+        elif roe < 0:
+            score -= 16
+            warns.append(f"目前處於虧損狀態 (ROE {roe}%)")
+    if op_m is not None:
+        if op_m >= 15.0:
+            score += 10
+            strengths.append(f"本業高毛利護城河 (營益率 {op_m}%)")
+        elif op_m < 3.0:
+            score -= 10
+            warns.append(f"本業獲利空間偏薄 (營益率 {op_m}%)")
+    if rev_g is not None:
+        if rev_g >= 15.0:
+            score += 12
+            strengths.append(f"營收高速成長 ({rev_g:+.1f}%)")
+        elif rev_g >= 5.0:
+            score += 5
+        elif rev_g <= -10.0:
+            score -= 12
+            warns.append(f"營收動能明顯衰退 ({rev_g:+.1f}%)")
+    if pe is not None:
+        if 0 < pe <= 16.0:
+            score += 10
+            strengths.append(f"估值具下檔防禦力 (PE {pe:.1f}x)")
+        elif pe >= 38.0:
+            score -= 12
+            warns.append(f"本益比偏高，留意估值修正 (PE {pe:.1f}x)")
+        elif pe < 0:
+            score -= 10
+            warns.append("本益比為負值（虧損）")
+    if pb is not None and pb >= 6.0:
+        score -= 5
+        warns.append(f"股價淨值比偏高 (PB {pb:.1f}x)")
+
+    has_any_data = any(v is not None for v in (pe, pb, roe, op_m, rev_g))
+    if not has_any_data:
+        warns.append("暫無財報數據（可能為 ETF 或資料源限流，未寫入快取，可稍後重試）")
+
+    q_score = int(np.clip(score, 10, 95))
+    rating = (
+        "A+ 優質核心" if q_score >= 80 else
+        "A 穩健優良" if q_score >= 68 else
+        "B 中性標準" if q_score >= 52 else
+        "C 高估值/轉弱" if q_score >= 38 else "D 體質偏弱"
+    )
+    source_note = " + ".join(used_sources) if used_sources else "暫無資料"
+
+    quality = FundamentalQualityReport(
+        quality_score=q_score, risk_equivalent=float(100 - q_score), rating=rating,
+        pe=pe, pb=pb, roe_pct=roe, op_margin_pct=op_m, rev_growth_pct=rev_g,
+        source_note=source_note,
+        strengths=strengths if strengths else ["財務結構大致符合產業平均水準"],
+        warnings=warns,
+    )
+
+    # 關鍵防呆：僅在有真實數據時寫入快取，空值絕不快取
+    if has_any_data:
+        st.session_state["fund_cache"][cache_key] = {
+            "ts": time.time(),
+            "quality": quality,
+            "yf_name": yf_name,
+        }
+
+    return quality, yf_name
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_single_stock_bundle(stock_id: str, fetch_start: str, end: str, fm_start: str, token: str):
+def fetch_single_stock_price_and_chips(stock_id: str, fetch_start: str, end: str, fm_start: str, token: str):
+    """快取個股歷史股價與籌碼資料"""
     clean_id = str(stock_id).strip().upper().replace(".TW", "").replace(".TWO", "")
     stk, resolved_sym = pd.DataFrame(), clean_id
     for suffix in [".TW", ".TWO"]:
@@ -318,85 +473,6 @@ def fetch_single_stock_bundle(stock_id: str, fetch_start: str, end: str, fm_star
             stk, resolved_sym = df, sym
             break
 
-    # 取得中文股名（優先 FinMind 全台股表 -> 次選 Yahoo shortName）
-    name_map = fetch_tw_stock_name_map(token)
-    stock_name = name_map.get(clean_id, "")
-
-    # 財務體質健檢
-    score = 52
-    strengths, warns = [], []
-    pe = pb = roe = op_m = rev_g = None
-    try:
-        info = yf.Ticker(resolved_sym).info or {}
-        if not stock_name:
-            stock_name = info.get("shortName") or info.get("longName") or ""
-        pe = info.get("trailingPE") or info.get("forwardPE")
-        pb = info.get("priceToBook")
-        roe_r, op_r, rev_r = info.get("returnOnEquity"), info.get("operatingMargins"), info.get("revenueGrowth")
-        roe = round(roe_r * 100, 1) if roe_r is not None else None
-        op_m = round(op_r * 100, 1) if op_r is not None else None
-        rev_g = round(rev_r * 100, 1) if rev_r is not None else None
-
-        if roe is not None:
-            if roe >= 15.0:
-                score += 14
-                strengths.append(f"股東報酬優異 (ROE {roe}%)")
-            elif roe >= 8.0:
-                score += 6
-                strengths.append(f"獲利能力穩健 (ROE {roe}%)")
-            elif roe < 0:
-                score -= 16
-                warns.append(f"目前處於虧損狀態 (ROE {roe}%)")
-        if op_m is not None:
-            if op_m >= 15.0:
-                score += 10
-                strengths.append(f"本業高毛利護城河 (營益率 {op_m}%)")
-            elif op_m < 3.0:
-                score -= 10
-                warns.append(f"本業獲利空間偏薄 (營益率 {op_m}%)")
-        if rev_g is not None:
-            if rev_g >= 15.0:
-                score += 12
-                strengths.append(f"營收高速成長 ({rev_g:+.1f}%)")
-            elif rev_g >= 5.0:
-                score += 5
-            elif rev_g <= -10.0:
-                score -= 12
-                warns.append(f"營收動能明顯衰退 ({rev_g:+.1f}%)")
-        if pe is not None:
-            if 0 < pe <= 16.0:
-                score += 10
-                strengths.append(f"估值具下檔防禦力 (PE {pe:.1f}x)")
-            elif pe >= 38.0:
-                score -= 12
-                warns.append(f"本益比偏高，留意估值修正 (PE {pe:.1f}x)")
-            elif pe < 0:
-                score -= 10
-                warns.append("本益比為負值（虧損）")
-        if pb is not None and pb >= 6.0:
-            score -= 5
-            warns.append(f"股價淨值比偏高 (PB {pb:.1f}x)")
-    except Exception:
-        warns.append("部分財報欄位暫缺，採中性基準評估")
-
-    display_name = f"{clean_id}-{stock_name}" if stock_name else clean_id
-
-    q_score = int(np.clip(score, 10, 95))
-    rating = (
-        "A+ 優質核心" if q_score >= 80 else
-        "A 穩健優良" if q_score >= 68 else
-        "B 中性標準" if q_score >= 52 else
-        "C 高估值/轉弱" if q_score >= 38 else "D 體質偏弱"
-    )
-    quality = FundamentalQualityReport(
-        quality_score=q_score, risk_equivalent=float(100 - q_score), rating=rating,
-        pe=round(pe, 1) if pe is not None else None, pb=round(pb, 2) if pb is not None else None,
-        roe_pct=roe, op_margin_pct=op_m, rev_growth_pct=rev_g,
-        strengths=strengths if strengths else ["財務結構大致符合產業平均水準"],
-        warnings=warns,
-    )
-
-    # 個股籌碼
     frames, stk_status = [], "OK"
     df_m, st1 = _finmind_get("TaiwanStockMarginPurchaseShortSale", fm_start, end, token, data_id=clean_id)
     if st1 != "OK":
@@ -431,11 +507,11 @@ def fetch_single_stock_bundle(stock_id: str, fetch_start: str, end: str, fm_star
         frames.append(i_out)
 
     stk_chips = pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
-    return stk, resolved_sym, display_name, quality, stk_chips, stk_status
+    return stk, resolved_sym, clean_id, stk_chips, stk_status
 
 
 # =========================================================
-# v8.2 核心風控運算引擎（大盤 40% + 個股 60%、樂觀賣出價）
+# v8.3 核心風控運算引擎（大盤 40% + 個股 60%、樂觀賣出價）
 # =========================================================
 class InstitutionalQuantRiskEngine:
     def __init__(self, config: Optional[RiskModelConfig] = None):
@@ -660,11 +736,17 @@ class InstitutionalQuantRiskEngine:
         token = get_finmind_token()
 
         twii, macro_data, mkt_chips, mkt_status = fetch_shared_market_data(fetch_start, end_str, fm_start, token)
-        stk, resolved_sym, display_name, quality, stk_chips, stk_status = fetch_single_stock_bundle(
+        stk, resolved_sym, clean_id, stk_chips, stk_status = fetch_single_stock_price_and_chips(
             stock_id, fetch_start, end_str, fm_start, token
         )
         if stk.empty or twii.empty:
             raise ValueError(f"查無股票代號「{stock_id}」，請確認是否為有效的台股上市／上櫃代碼。")
+
+        # 智慧基本面查詢（Yahoo + FinMind 雙重備援，空值不快取）
+        quality, yf_name = fetch_fundamentals_smart(clean_id, resolved_sym, token)
+        name_map = fetch_tw_stock_name_map(token)
+        stock_name = name_map.get(clean_id) or yf_name
+        display_name = f"{clean_id}-{stock_name}" if stock_name else clean_id
 
         live_news = fetch_news_risk_score("") if fast_batch else fetch_news_risk_score(stock_id)
         mkt_note = "真實籌碼" if not mkt_chips.empty else f"備援({mkt_status})"
@@ -798,223 +880,4 @@ class InstitutionalQuantRiskEngine:
 
 
 # =========================================================
-# 清晰版體質分析卡片與 Plotly 深色圖表
-# =========================================================
-def render_health_card(q: FundamentalQualityReport):
-    def _tag(val, good_cond, bad_cond, good_txt, mid_txt, bad_txt):
-        if val is None or pd.isna(val):
-            return '<span class="m-tag" style="color:#6e7681;">無資料</span>'
-        if good_cond(val):
-            return f'<span class="m-tag tag-good">{good_txt}</span>'
-        if bad_cond(val):
-            return f'<span class="m-tag tag-bad">{bad_txt}</span>'
-        return f'<span class="m-tag tag-mid">{mid_txt}</span>'
-
-    roe_t = _tag(q.roe_pct, lambda x: x >= 15, lambda x: x < 5, "優異", "穩健", "偏弱")
-    op_t = _tag(q.op_margin_pct, lambda x: x >= 15, lambda x: x < 3, "高毛利", "普通", "偏薄")
-    rev_t = _tag(q.rev_growth_pct, lambda x: x >= 15, lambda x: x <= -10, "高成長", "平穩", "衰退")
-    pe_t = _tag(q.pe, lambda x: 0 < x <= 16, lambda x: x >= 38 or x < 0, "便宜", "合理", "偏貴/虧損")
-    pb_t = _tag(q.pb, lambda x: 0 < x <= 2.0, lambda x: x >= 6.0, "低估", "合理", "溢價")
-
-    pb_str = f"{q.pb:.2f}x" if q.pb is not None else "N/A"
-    str_html = "".join([f"<div>✅ {s}</div>" for s in q.strengths])
-    warn_html = "".join([f"<div>⚠️ {w}</div>" for w in q.warnings]) if q.warnings else "<div>✨ 目前無明顯財務警訊</div>"
-
-    st.markdown(
-        f"""<div class="risk-card">
-        <div class="card-title">📊 個股財務體質健檢</div>
-        <div style="font-size:1.35rem;font-weight:700;color:#f0f6fc;">{q.quality_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{q.rating}】</div>
-        <div class="metric-grid">
-            <div class="metric-box"><div class="m-label">ROE 報酬率</div><div class="m-val">{_fmt_num(q.roe_pct, '%')}</div>{roe_t}</div>
-            <div class="metric-box"><div class="m-label">營業利益率</div><div class="m-val">{_fmt_num(q.op_margin_pct, '%')}</div>{op_t}</div>
-            <div class="metric-box"><div class="m-label">營收年增率</div><div class="m-val">{_fmt_num(q.rev_growth_pct, '%', signed=True)}</div>{rev_t}</div>
-            <div class="metric-box"><div class="m-label">本益比 PE</div><div class="m-val">{_fmt_num(q.pe, 'x')}</div>{pe_t}</div>
-            <div class="metric-box"><div class="m-label">淨值比 PB</div><div class="m-val">{pb_str}</div>{pb_t}</div>
-        </div>
-        <div class="health-list">{str_html}{warn_html}</div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-
-
-def render_dark_chart(res: Dict):
-    df = res["hist_df"]
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07, row_heights=[0.62, 0.38]
-    )
-
-    fig.add_trace(go.Scatter(x=df.index, y=df["close"], name="收盤價", line=dict(color="#58a6ff", width=2.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["sell_p"], name="建議賣出價", line=dict(color="#d2a8ff", width=1.5, dash="dot")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["stop_p"], name="下檔防守價", line=dict(color="#f0883e", width=1.6, dash="dash")), row=1, col=1)
-
-    fig.add_trace(go.Scatter(x=df.index, y=df["mri"], name="大盤風險 (MRI)", line=dict(color="#ff7b72", width=2)), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["sri"], name="個股風險 (SRI)", line=dict(color="#3fb950", width=2, dash="dash")), row=2, col=1)
-
-    fig.add_hrect(y0=65, y1=100, fillcolor="rgba(255,123,114,0.12)", line_width=0, row=2, col=1)
-    fig.add_hrect(y0=0, y1=48, fillcolor="rgba(63,185,80,0.10)", line_width=0, row=2, col=1)
-    fig.add_hline(y=65, line_dash="dot", line_color="#ff7b72", opacity=0.7, row=2, col=1)
-    fig.add_hline(y=48, line_dash="dot", line_color="#3fb950", opacity=0.7, row=2, col=1)
-
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#0b0e14",
-        plot_bgcolor="#161b22",
-        height=520,
-        margin=dict(l=10, r=10, t=35, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=11)),
-        hovermode="x unified",
-    )
-    fig.update_yaxes(title_text="股價", gridcolor="#30363d", row=1, col=1)
-    fig.update_yaxes(title_text="風險分", range=[0, 102], gridcolor="#30363d", row=2, col=1)
-    fig.update_xaxes(gridcolor="#30363d")
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-# =========================================================
-# 側邊欄：FinMind Token 設定（選填）
-# =========================================================
-with st.sidebar:
-    st.markdown("### ⚙️ 系統連線設定")
-    st.text_input(
-        "FinMind API Token（選填）",
-        type="password",
-        key="user_finmind_token",
-        help="若遇到免費限流，可至 finmindtrade.com 免費申請 Token 填入。",
-    )
-    st.caption("燈號標準：\n🟢 安全 (<48)\n🟡 中等 (48~64)\n🔴 危險 (≥65)\n\n權重配置：大盤環境 40% ＋ 個股籌碼與體質 60%")
-
-
-# =========================================================
-# 主介面：雙分頁（單股一鍵查閱 / 多股批量掃描）
-# =========================================================
-st.markdown("## 🛡️ 台股量化風控儀表板")
-tab1, tab2 = st.tabs(["🔍 單股風控診斷", "📋 多股批量掃描"])
-
-engine = InstitutionalQuantRiskEngine()
-
-with tab1:
-    col_in, col_btn = st.columns([3, 1.2])
-    with col_in:
-        stock_input = st.text_input("輸入台股代號（上市／上櫃自動偵測）", value="2330", placeholder="例如 2330、2382、6274", label_visibility="collapsed")
-    with col_btn:
-        run_btn = st.button("一鍵分析", type="primary", use_container_width=True)
-
-    if stock_input.strip():
-        with st.spinner(f"正在運算 {stock_input.strip()} 量化風控與體質模型..."):
-            try:
-                res = engine.run_analysis(stock_input.strip())
-                m_icon, m_stat, m_col, m_cls = get_traffic_light(res["mri"])
-                s_icon, s_stat, s_col, s_cls = get_traffic_light(res["sri"])
-                sell_pct = (res["sell_p"] / res["close"] - 1) * 100
-                stop_pct = (res["stop_p"] / res["close"] - 1) * 100
-
-                st.markdown(f"### {res['display_name']}")
-                st.caption(f"基準日：{res['date']} ｜ 收盤價：{res['close']} 元 ｜ 籌碼：{res['stk_note']}")
-
-                # 第一排：個股風險 vs 大盤風險
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown(
-                        f"""<div class="risk-card">
-                        <div class="card-title">個股風險指數 (SRI)</div>
-                        <div class="card-value" style="color:{s_col};">{s_icon} {res['sri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
-                        <div class="card-sub"><span class="{s_cls}">{s_stat}</span> &nbsp;籌碼風險 {res['chip']}/100</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-                with c2:
-                    st.markdown(
-                        f"""<div class="risk-card">
-                        <div class="card-title">大盤風險指數 (MRI)</div>
-                        <div class="card-value" style="color:{m_col};">{m_icon} {res['mri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
-                        <div class="card-sub"><span class="{m_cls}">{m_stat}</span> &nbsp;佔比權重 40%</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-
-                # 第二排：動態價位卡
-                c3, c4 = st.columns(2)
-                with c3:
-                    st.markdown(
-                        f"""<div class="risk-card">
-                        <div class="card-title">建議賣出價（目標調節區）</div>
-                        <div class="card-value" style="color:#d2a8ff;">{res['sell_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
-                        <div class="card-sub">距收盤 {sell_pct:+.1f}%</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-                with c4:
-                    st.markdown(
-                        f"""<div class="risk-card">
-                        <div class="card-title">下檔防守價</div>
-                        <div class="card-value" style="color:#f0883e;">{res['stop_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
-                        <div class="card-sub">距收盤 {stop_pct:+.1f}%</div>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-
-                # 第三排：清楚的五大指標體質分析卡
-                render_health_card(res["quality"])
-
-                # 第四排：互動式走勢圖
-                render_dark_chart(res)
-
-            except Exception as e:
-                st.error(f"分析失敗：{e}")
-
-with tab2:
-    batch_input = st.text_area(
-        "輸入多檔代號（支援逗號、空白或換行分隔）",
-        value="2330, 2454, 2382, 6274, 2881",
-        height=72,
-    )
-    if st.button("開始批量掃描", type="primary", use_container_width=True):
-        raw_tokens = re.split(r"[,，\s\n]+", batch_input.strip())
-        tickers = list(dict.fromkeys([t.strip().upper() for t in raw_tokens if t.strip()]))
-
-        if not tickers:
-            st.warning("請先輸入至少一檔台股代號。")
-        else:
-            rows = []
-            prog = st.progress(0)
-            status_txt = st.empty()
-            for idx, tid in enumerate(tickers):
-                status_txt.caption(f"正在掃描 ({idx + 1}/{len(tickers)})：{tid} ...")
-                try:
-                    r = engine.run_analysis(tid, lookback_days=20, fast_batch=True)
-                    m_i, _, _, _ = get_traffic_light(r["mri"])
-                    s_i, s_st, _, _ = get_traffic_light(r["sri"])
-                    sell_pct = (r["sell_p"] / r["close"] - 1) * 100
-                    rows.append({
-                        "標的": r["display_name"],
-                        "收盤價": r["close"],
-                        "個股風險": f"{s_i} {r['sri']} ({s_st})",
-                        "籌碼分": r["chip"],
-                        "體質評等": f"{r['quality'].quality_score} ({r['quality'].rating.split()[0]})",
-                        "建議賣出價": f"{r['sell_p']:.1f} ({sell_pct:+.1f}%)",
-                        "下檔防守價": r["stop_p"],
-                        "大盤MRI": f"{m_i} {r['mri']}",
-                    })
-                except Exception as e:
-                    rows.append({
-                        "標的": tid,
-                        "收盤價": None,
-                        "個股風險": f"失敗({str(e)[:12]})",
-                        "籌碼分": None,
-                        "體質評等": "-",
-                        "建議賣出價": "-",
-                        "下檔防守價": None,
-                        "大盤MRI": "-",
-                    })
-                prog.progress((idx + 1) / len(tickers))
-            prog.empty()
-            status_txt.empty()
-            st.session_state["batch_results"] = pd.DataFrame(rows)
-
-    if "batch_results" in st.session_state and not st.session_state["batch_results"].empty:
-        st.dataframe(st.session_state["batch_results"], use_container_width=True, hide_index=True)
-
-st.markdown(
-    '<div class="disclaimer">本系統所有數據與風險指標皆由公開資訊與量化演算法自動運算產生，僅供風險控管參考，絕非投資買賣建議。<br>投資人應獨立判斷並自負盈虧與法律責任。</div>',
-    unsafe_allow_html=True,
-)
+# 清晰版體質分析
