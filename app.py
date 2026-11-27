@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 warnings.filterwarnings("ignore")
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 =========================================================
-頁面基本設定與黑底質感 CSS（手機優先排版）
+#頁面基本設定與黑底質感 CSS（手機優先排版）
 =========================================================
 st.set_page_config(
 page_title="台股量化風控儀表板",
@@ -86,7 +86,7 @@ FALLBACK_STOCK_NAMES = {
 "0050": "元大台灣50", "0056": "元大高股息", "00878": "國泰永續高股息", "00919": "群益台灣精選高息",
 }
 =========================================================
-工具函式與資料結構
+#工具函式與資料結構
 =========================================================
 def get_finmind_token() -> str:
 """優先讀取 Streamlit Cloud Secrets，其次讀取側邊欄手動輸入"""
@@ -206,7 +206,7 @@ divergence_warning: Optional[str]
 pain_report: ChipPainReport
 downside_alpha: DownsideAlphaReport
 =========================================================
-進階量化因子演算法（狀態機 / 背離懲罰 / 痛點指數 / 逆風韌性）
+#進階量化因子演算法（狀態機 / 背離懲罰 / 痛點指數 / 逆風韌性）
 =========================================================
 def get_dynamic_regime_weights(mri_score: float) -> Tuple[float, float, str]:
 """
@@ -334,7 +334,7 @@ avg_inst_net_lots=avg_inst_lots,
 note=note,
 )
 =========================================================
-後台消息面與資料擷取層（附 Streamlit 雲端快取）
+#後台消息面與資料擷取層（附 Streamlit 雲端快取）
 =========================================================
 BEARISH_KW = {
 "升息": 3.0, "通膨": 2.5, "關稅": 3.0, "制裁": 2.5, "禁令": 2.5,
@@ -730,7 +730,7 @@ frames.append(i_out)
 stk_chips = pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
 return stk, resolved_sym, clean_id, stk_chips, stk_status
 =========================================================
-v9.0 核心風控運算引擎（含動態狀態機、背離懲罰、痛點指數、逆風韌性）
+#v9.0 核心風控運算引擎（含動態狀態機、背離懲罰、痛點指數、逆風韌性）
 =========================================================
 class InstitutionalQuantRiskEngine:
 def init(self, config: Optional[RiskModelConfig] = None):
@@ -1114,7 +1114,7 @@ return {
 "hist_df": hist_df,
 }
 =========================================================
-卡片渲染：進階風控偵測、財務體質、未來展望、Plotly 深色圖表
+#卡片渲染：進階風控偵測、財務體質、未來展望、Plotly 深色圖表
 =========================================================
 def render_advanced_overlay_card(ov: AdvancedRiskOverlay):
 badges_html = f'<span class="badge-yellow">狀態機：{ov.regime_name}</span> '
@@ -1242,7 +1242,7 @@ fig.update_yaxes(title_text="風險分", range=[0, 102], gridcolor="#30363d", ro
 fig.update_xaxes(gridcolor="#30363d")
 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 =========================================================
-側邊欄：FinMind Token 設定（選填）
+#側邊欄：FinMind Token 設定（選填）
 =========================================================
 with st.sidebar:
 st.markdown("### ⚙️ 系統連線設定")
@@ -1260,7 +1260,7 @@ st.caption(
 "• MRI ≥ 70：大盤 65% / 個股 35%"
 )
 =========================================================
-主介面：雙分頁（單股一鍵查閱 / 多股批量掃描）
+#主介面：雙分頁（單股一鍵查閱 / 多股批量掃描）
 =========================================================
 st.markdown("## 🛡️ 台股量化風控儀表板")
 tab1, tab2 = st.tabs(["🔍 單股風控診斷", "📋 多股批量掃描"])
