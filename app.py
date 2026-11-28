@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 import logging
 import re
@@ -24,20 +26,22 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 # 頁面基本設定與黑底質感 CSS（手機優先排版）
 # =========================================================
 st.set_page_config(
-    page_title="台股量化風控儀表板 v10.1",
+    page_title="台股量化風控儀表板 v10.2",
     page_icon="🛡️",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
-def _render_html(html: str):
+
+def _render_html(html: str) -> None:
     """移除每行前導空白與空行，徹底避免 Streamlit Markdown 將 HTML 誤判為縮排程式碼區塊"""
     clean = "\n".join(line.strip() for line in html.splitlines() if line.strip())
     st.markdown(clean, unsafe_allow_html=True)
 
 
 # 自訂深色主題樣式：風險卡片、狀態徽章、四象限標籤、指標網格與免責聲明
-_render_html("""
+_render_html(
+    """
     <style>
     .stApp { background-color: #0b0e14; color: #e6edf3; }
     .risk-card {
@@ -86,10 +90,11 @@ _render_html("""
     .health-list { font-size: 0.84rem; color: #c9d1d9; margin-top: 6px; line-height: 1.6; }
     .disclaimer { font-size: 0.75rem; color: #6e7681; text-align: center; margin-top: 24px; line-height: 1.5; }
     </style>
-    """)
+    """
+)
 
 # 內建熱門台股中文名稱備援表（當 API 限流時仍可正確顯示中文）
-FALLBACK_STOCK_NAMES = {
+FALLBACK_STOCK_NAMES: Dict[str, str] = {
     "2330": "台積電", "2454": "聯發科", "2317": "鴻海", "2382": "廣達", "2308": "台達電",
     "2303": "聯電", "3711": "日月光投控", "2881": "富邦金", "2882": "國泰金", "2891": "中信金",
     "2886": "兆豐金", "2884": "玉山金", "2383": "台光電", "6274": "台燿", "8046": "南電",
@@ -105,9 +110,9 @@ FALLBACK_STOCK_NAMES = {
 def get_finmind_token() -> str:
     """優先讀取側邊欄手動輸入的 Token，其次讀取 Streamlit Secrets 中的 FINMIND_TOKEN"""
     if st.session_state.get("user_finmind_token"):
-        return st.session_state["user_finmind_token"].strip()
+        return str(st.session_state["user_finmind_token"]).strip()
     try:
-        return st.secrets.get("FINMIND_TOKEN", "").strip()
+        return str(st.secrets.get("FINMIND_TOKEN", "")).strip()
     except Exception:
         return ""
 
@@ -121,6 +126,23 @@ def _safe_float(val) -> Optional[float]:
         return f if np.isfinite(f) else None
     except Exception:
         return None
+
+
+def _safe_pct_change(series: pd.Series, periods: int = 1) -> pd.Series:
+    """跨版本相容的百分比變化計算（不偷偷前向填補，避免停牌日產生假性 0% 漲跌）"""
+    s = pd.to_numeric(series, errors="coerce")
+    prev = s.shift(periods)
+    return s / prev.where(prev != 0.0) - 1.0
+
+
+def _dedup_sort_index(df: pd.DataFrame) -> pd.DataFrame:
+    """移除重複日期索引並按時間排序，避免 reindex 報錯"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out.index = pd.to_datetime(out.index).tz_localize(None)
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out
 
 
 def round_tw_tick(price: float) -> float:
@@ -149,17 +171,23 @@ def _fmt_num(val: Optional[float], suffix: str = "", signed: bool = False) -> st
     return f"{val:+.1f}{suffix}" if signed else f"{val:.1f}{suffix}"
 
 
-def _latest_rolling_zscore(series: pd.Series, window: int = 60, min_periods: int = 20) -> Optional[float]:
-    """計算序列最新值相對於過去 window 日自身分佈的標準化 Z-Score（自適應動態門檻核心）"""
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < min_periods:
-        return None
-    tail = s.tail(window)
-    std = float(tail.std(ddof=0))
-    if not np.isfinite(std) or std < 1e-8:
-        return 0.0
-    z = (float(tail.iloc[-1]) - float(tail.mean())) / std
-    return round(float(np.clip(z, -4.0, 4.0)), 2)
+def rolling_zscore(
+    series: pd.Series,
+    window: int = 60,
+    min_periods: int = 20,
+    clip_val: float = 4.0,
+) -> pd.Series:
+    """逐日滾動 Z-Score（僅使用過去 window 日自身分佈，無前視偏誤）"""
+    s = pd.to_numeric(series, errors="coerce")
+    roll = s.rolling(window=window, min_periods=min_periods)
+    mean = roll.mean()
+    std = roll.std(ddof=0)
+
+    valid_obs = s.notna() & mean.notna() & std.notna()
+    safe_std = std.where(std >= 1e-8)
+    z = (s - mean) / safe_std
+    z = z.where(~(valid_obs & (std < 1e-8)), 0.0)
+    return z.clip(-clip_val, clip_val)
 
 
 def get_traffic_light(score: int) -> Tuple[str, str, str, str]:
@@ -174,14 +202,12 @@ def get_traffic_light(score: int) -> Tuple[str, str, str, str]:
 @dataclass
 class GoldenRatioWeights:
     """多因子權重設定：第一層大盤系統風險 (MRI) 與第二層個股風險 (SRI) 基準權重"""
-    # 第一層：大盤系統風險 (MRI) 六大維度權重（總和為 1.0）
-    w_us_tech: float = 0.200       # 美股科技/半導體動能
-    w_rates_fx: float = 0.180      # 美債殖利率與新台幣匯率
-    w_tw_market: float = 0.238     # 台股大盤位階、融資與法人動向
-    w_commodities: float = 0.120   # 原油與黃金通膨/避險訊號
-    w_btc_liquidity: float = 0.100 # 比特幣流動性風險偏好
-    w_vix_news: float = 0.162      # VIX 恐慌指數與新聞情緒
-    # 第二層：個股風險 (SRI) 基準權重（實際會由「動態狀態機 × Rolling Beta」自動切換）
+    w_us_tech: float = 0.200
+    w_rates_fx: float = 0.180
+    w_tw_market: float = 0.238
+    w_commodities: float = 0.120
+    w_btc_liquidity: float = 0.100
+    w_vix_news: float = 0.162
     w_mri_transmission: float = 0.400
     w_idiosyncratic: float = 0.600
     w_stock_chip_in_idio: float = 0.500
@@ -195,8 +221,8 @@ class RiskModelConfig:
     window_days: int = 10
     chip_smooth_days: int = 5
     weights: GoldenRatioWeights = field(default_factory=GoldenRatioWeights)
-    lock_floor_level1: float = 68.0  # 符合 2 項系統性惡化條件時的大盤風險地板
-    lock_floor_level2: float = 78.0  # 符合 3 項系統性惡化條件時的大盤風險地板
+    lock_floor_level1: float = 68.0
+    lock_floor_level2: float = 78.0
 
 
 @dataclass
@@ -234,9 +260,9 @@ class ForwardOutlookReport:
 
 @dataclass
 class ChipPainReport:
-    """自適應籌碼痛點指數報告：結合 20 日 VWAP 乖離、20 日融資變化與 60 日自適應 Z-Score"""
-    status: str                          # 多殺多預警 / 籌碼乾淨 / 中性正常 / 暫無融資資料
-    risk_adj: float                      # 對籌碼風險分的加減分 (-10 ~ +15)
+    """自適應籌碼痛點指數報告：結合 20 日典型價 VWAP 乖離、20 日融資變化與 60 日自適應 Z-Score"""
+    status: str
+    risk_adj: float
     vwap_20: Optional[float] = None
     price_vs_vwap_pct: Optional[float] = None
     margin_chg_20d_pct: Optional[float] = None
@@ -247,8 +273,8 @@ class ChipPainReport:
 
 @dataclass
 class DownsideAlphaReport:
-    """逆風韌性係數報告：統計大盤單日跌逾 1% 時的個股表現與法人買超"""
-    has_badge: bool                      # 是否獲得「🛡️ 逆風抗跌徽章」
+    """逆風韌性係數報告：統計近 60 日大盤單日跌逾 1% 時的個股表現與法人買超"""
+    has_badge: bool
     down_days_count: int = 0
     avg_stock_ret_pct: Optional[float] = None
     avg_twii_ret_pct: Optional[float] = None
@@ -258,24 +284,24 @@ class DownsideAlphaReport:
 
 @dataclass
 class DynamicFactorReport:
-    """底層動態化因子報告：Rolling Beta 權重調校、SRI 風險加速度、自適應 Z-Score 狀態"""
+    """底層動態化因子報告：Rolling Beta 權重調校、SRI 風險加速度、自適應 ATR 回撤"""
     rolling_beta_60d: float
     base_w_mri: float
     beta_adj_w_mri: float
-    sri_velocity_3d: float               # 近 3 日 SRI 風險斜率（正值=升溫，負值=收斂）
-    velocity_tag: str                    # 加速惡化 / 緩步升溫 / 風險收斂 / 平穩
-    velocity_adj: float                  # 套用於最終 SRI 的加速度微調分
-    atr_norm_dd: Optional[float] = None  # 以個股自身 ATR 正規化之 20 日回撤倍數
+    sri_velocity_3d: float
+    velocity_tag: str
+    velocity_adj: float
+    atr_norm_dd: Optional[float] = None
     note: str = ""
 
 
 @dataclass
 class ActiveAlphaReport:
-    """主動式進攻因子報告與四象限決策標籤（解決死魚股拿高安全分盲點）"""
-    alpha_score: int                     # 5 ~ 98，越高代表資金主動表態越強
-    rating: str                          # 強力點火 / 主動偏多 / 溫和蓄勢 / 動能偏弱 / 資金退潮
-    quadrant: str                        # 🚀 主升段首選 / 🛡️ 防禦盤整 / ⚡ 高檔博弈 / 🚫 弱勢迴避
-    quadrant_badge_cls: str              # badge-green / badge-blue / badge-yellow / badge-red
+    """主動式進攻因子報告與四象限決策標籤"""
+    alpha_score: int
+    rating: str
+    quadrant: str
+    quadrant_badge_cls: str
     quadrant_desc: str
     rs_vs_ma20_pct: Optional[float] = None
     rs_new_high_60d: bool = False
@@ -288,7 +314,7 @@ class ActiveAlphaReport:
 
 @dataclass
 class AdvancedRiskOverlay:
-    """v10 進階風控與主動因子彙整結果，供單股診斷與批量掃描呈現"""
+    """v10.2 進階風控與主動因子彙整結果"""
     regime_name: str
     w_mri_dynamic: float
     w_idio_dynamic: float
@@ -301,52 +327,55 @@ class AdvancedRiskOverlay:
 
 
 # =========================================================
-# 進階動態與主動量化因子演算法（v10.0 核心升級）
+# 無前視偏誤向量化因子演算法（v10.2 核心升級）
 # =========================================================
-def compute_rolling_beta(
+def compute_rolling_beta_series(
     stock_close: pd.Series,
-    twii_close: pd.Series,
+    mkt_close: pd.Series,
     window: int = 60,
     min_periods: int = 20,
-) -> float:
+    clip_bounds: Tuple[float, float] = (0.25, 2.20),
+    default_beta: float = 1.0,
+) -> pd.Series:
     """
-    計算個股近 60 日相對於加權指數的 Rolling Beta（滾動敏感度）：
-    Beta = Cov(r_stock, r_mkt) / Var(r_mkt)
+    計算逐日滾動 Beta（無前視偏誤）：
+    同步個股與大盤有效報酬遮罩，避免停牌日產生假性 0% 漲跌或分母樣本數不一致。
     """
-    s_ret = stock_close.pct_change()
-    m_ret = twii_close.pct_change()
-    aligned = pd.concat([s_ret.rename("s"), m_ret.rename("m")], axis=1).dropna().tail(window)
-    if len(aligned) < min_periods:
-        return 1.0
-    var_m = float(aligned["m"].var(ddof=0))
-    if not np.isfinite(var_m) or var_m < 1e-10:
-        return 1.0
-    cov_sm = float(np.cov(aligned["s"], aligned["m"], ddof=0)[0, 1])
-    beta = cov_sm / var_m
-    if not np.isfinite(beta):
-        return 1.0
-    return round(float(np.clip(beta, 0.25, 2.20)), 2)
+    aligned_stk = pd.to_numeric(stock_close, errors="coerce").reindex(mkt_close.index)
+    s_ret = _safe_pct_change(aligned_stk, periods=1)
+    m_ret = _safe_pct_change(pd.to_numeric(mkt_close, errors="coerce"), periods=1)
+
+    both_valid = s_ret.notna() & m_ret.notna()
+    s_clean = s_ret.where(both_valid)
+    m_clean = m_ret.where(both_valid)
+
+    cov_sm = s_clean.rolling(window=window, min_periods=min_periods).cov(m_clean)
+    var_m = m_clean.rolling(window=window, min_periods=min_periods).var()
+
+    beta = cov_sm / var_m.where(var_m >= 1e-10)
+    beta = beta.replace([np.inf, -np.inf], np.nan).fillna(default_beta)
+    return beta.clip(lower=clip_bounds[0], upper=clip_bounds[1]).round(2).rename("rolling_beta_60d")
 
 
 def get_dynamic_regime_weights(mri_score: float, rolling_beta: float = 1.0) -> Tuple[float, float, float, str]:
     """
-    1. 動態權重狀態機 × 個股 Rolling Beta (Adaptive Regime-Switching)：
-    - 先依大盤 MRI 決定基準權重（低波動 15% / 常態 40% / 恐慌 65%）
-    - 再乘上個股 60 日 Beta 敏感度係數（限制在 0.55x ~ 1.45x），並將最終大盤權重收斂於 8% ~ 78%
-    回傳：(最終大盤權重, 最終個股權重, 基準大盤權重, 狀態名稱)
+    動態權重狀態機 × 單日 Rolling Beta：
+    依當日 MRI 決定基準權重（低波動 15% / 常態 40% / 恐慌 65%），再乘以 Beta 敏感度。
     """
-    if mri_score < 45.0:
+    if pd.isna(mri_score):
+        base_mri, regime = 0.40, "常態震盪期"
+    elif mri_score < 45.0:
         base_mri, regime = 0.15, "低波動多頭期"
     elif mri_score >= 70.0:
         base_mri, regime = 0.65, "系統性恐慌期"
     else:
         base_mri, regime = 0.40, "常態震盪期"
 
-    beta_mult = float(np.clip(rolling_beta, 0.55, 1.45))
-    w_mri_adj = float(np.clip(base_mri * beta_mult, 0.08, 0.78))
+    beta_val = 1.0 if pd.isna(rolling_beta) else float(rolling_beta)
+    beta_mult = float(np.clip(beta_val, 0.55, 1.45))
+    w_mri_adj = round(float(np.clip(base_mri * beta_mult, 0.08, 0.78)), 4)
     w_idio_adj = round(1.0 - w_mri_adj, 4)
-    w_mri_adj = round(w_mri_adj, 4)
-    label = f"{regime} ({int(round(w_mri_adj * 100))}/{int(round(w_idio_adj * 100))}｜β={rolling_beta:.2f})"
+    label = f"{regime} ({int(round(w_mri_adj * 100))}/{int(round(w_idio_adj * 100))}｜β={beta_val:.2f})"
     return w_mri_adj, w_idio_adj, base_mri, label
 
 
@@ -357,9 +386,8 @@ def detect_divergence_penalty(
     trend_risk: float,
 ) -> Tuple[float, Optional[str]]:
     """
-    2. 訊號背離非線性陷阱偵測 (Divergence Penalty)：
-    當基本面/展望風險極低（<= 35，代表基本面佳）但籌碼/趨勢風險極高（>= 72，代表法人撤出或破線），
-    避免線性平均掩蓋「利多出貨」陷阱，直接加入 +15 ~ +20 風險懲罰與警語。
+    訊號背離非線性陷阱偵測：
+    基本面與展望偏佳（風險分 <= 35）但籌碼與趨勢轉差（風險分 >= 72）時，施加 +15 ~ +20 懲罰。
     """
     fund_avg_risk = (quality_risk + outlook_risk) / 2.0
     action_avg_risk = (chip_risk + trend_risk) / 2.0
@@ -371,148 +399,242 @@ def detect_divergence_penalty(
     return 0.0, None
 
 
-def compute_chip_pain_index(
+def compute_chip_pain_series(
     stock_df: pd.DataFrame,
     margin_series: Optional[pd.Series] = None,
-) -> ChipPainReport:
+    vwap_window: int = 20,
+    z_window: int = 60,
+    z_min_periods: int = 20,
+    margin_lag: int = 0,
+) -> pd.DataFrame:
     """
-    3. 自適應籌碼痛點指數 (Adaptive Pain Index)：
-    同時計算「絕對門檻」與「過去 60 日自身 Z-Score」：
-    - 解決低波動股（如金融股）跌 4% 其實已是 -2σ 異常、高波動股跌 4% 僅屬日常雜訊的問題
+    向量化自適應籌碼痛點指數（無前視偏誤）：
+    - 統一採用典型價 (High + Low + Close) / 3 計算 20 日滾動 VWAP
+    - 逐日以 60 日滾動 Z-Score 與絕對門檻判斷「多殺多預警 / 籌碼乾淨 / 中性正常」
     """
-    if stock_df is None or len(stock_df) < 20:
+    idx = stock_df.index
+    high = pd.to_numeric(stock_df["High"], errors="coerce")
+    low = pd.to_numeric(stock_df["Low"], errors="coerce")
+    close = pd.to_numeric(stock_df["Close"], errors="coerce")
+    vol = pd.to_numeric(stock_df["Volume"], errors="coerce").fillna(0.0)
+
+    tp = (high + low + close) / 3.0
+    vol_sum = vol.rolling(vwap_window, min_periods=vwap_window).sum()
+    pv_sum = (tp * vol).rolling(vwap_window, min_periods=vwap_window).sum()
+    roll_vwap = (pv_sum / vol_sum.replace(0.0, np.nan)).fillna(
+        close.rolling(vwap_window, min_periods=vwap_window).mean()
+    )
+
+    price_vs_vwap_pct = (close / roll_vwap.where(roll_vwap > 0.0) - 1.0) * 100.0
+    vwap_z = rolling_zscore(price_vs_vwap_pct, window=z_window, min_periods=z_min_periods)
+
+    if margin_series is not None and not margin_series.empty:
+        margin_raw = pd.to_numeric(margin_series, errors="coerce")
+        margin_raw = margin_raw[~margin_raw.index.duplicated(keep="last")].sort_index()
+        margin = margin_raw.reindex(idx)
+        if margin_lag > 0:
+            margin = margin.shift(margin_lag)
+        prev_margin = margin.shift(vwap_window)
+        margin_chg_pct = (margin / prev_margin.where(prev_margin > 0.0) - 1.0) * 100.0
+        margin_z = rolling_zscore(margin_chg_pct, window=z_window, min_periods=z_min_periods)
+    else:
+        margin_chg_pct = pd.Series(np.nan, index=idx, dtype=float)
+        margin_z = pd.Series(np.nan, index=idx, dtype=float)
+
+    has_data = price_vs_vwap_pct.notna() & margin_chg_pct.notna()
+    z_ready = vwap_z.notna() & margin_z.notna()
+
+    is_classic_squeeze = (margin_chg_pct >= 10.0) & (price_vs_vwap_pct <= -8.0)
+    is_adaptive_squeeze = z_ready & (margin_z >= 1.5) & (vwap_z <= -1.5) & (price_vs_vwap_pct <= -2.5)
+    is_squeeze = has_data & (is_classic_squeeze | is_adaptive_squeeze)
+
+    is_classic_clean = (margin_chg_pct <= -5.0) & (price_vs_vwap_pct >= 0.0)
+    is_adaptive_clean = z_ready & (margin_z <= -1.0) & (vwap_z >= 0.5) & (price_vs_vwap_pct >= 0.0)
+    is_clean = has_data & (~is_squeeze) & (is_classic_clean | is_adaptive_clean)
+
+    risk_adj = np.select([is_squeeze, is_clean], [15.0, -10.0], default=0.0)
+    status = np.select(
+        [~has_data, is_squeeze, is_clean],
+        ["暫無融資資料", "多殺多預警", "籌碼乾淨"],
+        default="中性正常",
+    )
+    trigger_tag = np.where(
+        is_squeeze & (~is_classic_squeeze),
+        "自適應異常",
+        np.where(is_squeeze, "槓桿套牢", ""),
+    )
+
+    return pd.DataFrame(
+        {
+            "vwap_20": roll_vwap.round(2),
+            "price_vs_vwap_pct": price_vs_vwap_pct.round(2),
+            "vwap_zscore_60d": vwap_z.round(2),
+            "margin_chg_20d_pct": margin_chg_pct.round(1),
+            "margin_zscore_60d": margin_z.round(2),
+            "pain_status": status,
+            "pain_trigger": trigger_tag,
+            "pain_risk_adj": risk_adj.astype(float),
+            "pain_data_valid": has_data.astype(int),
+        },
+        index=idx,
+    )
+
+
+def _extract_latest_chip_pain_report(pain_df: pd.DataFrame) -> ChipPainReport:
+    """從逐日向量化籌碼痛點表中提取最新一日摘要報告"""
+    if pain_df is None or pain_df.empty:
         return ChipPainReport(status="資料不足", risk_adj=0.0, note="交易日不足 20 天")
 
-    tp = (stock_df["High"] + stock_df["Low"] + stock_df["Close"]) / 3.0
-    vol = stock_df["Volume"].fillna(0.0)
-    roll_vwap = (tp * vol).rolling(20).sum() / vol.rolling(20).sum().replace(0, np.nan)
-    roll_vwap = roll_vwap.fillna(stock_df["Close"].rolling(20).mean())
+    last = pain_df.iloc[-1]
+    status = str(last.get("pain_status", "中性正常"))
+    risk_adj = float(last.get("pain_risk_adj", 0.0))
+    vwap_20 = _safe_float(last.get("vwap_20"))
+    p_vs_v = _safe_float(last.get("price_vs_vwap_pct"))
+    m_chg = _safe_float(last.get("margin_chg_20d_pct"))
+    v_z = _safe_float(last.get("vwap_zscore_60d"))
+    m_z = _safe_float(last.get("margin_zscore_60d"))
+    trigger = str(last.get("pain_trigger", ""))
 
-    vwap_20 = float(roll_vwap.iloc[-1])
-    latest_close = float(stock_df["Close"].iloc[-1])
-    vwap_gap_series = (stock_df["Close"] / roll_vwap - 1.0) * 100.0
-    price_vs_vwap_pct = round(float(vwap_gap_series.iloc[-1]), 2) if np.isfinite(vwap_gap_series.iloc[-1]) else None
-    vwap_z = _latest_rolling_zscore(vwap_gap_series, window=60, min_periods=20)
-
-    margin_chg_pct = None
-    margin_z = None
-    if margin_series is not None:
-        m = pd.to_numeric(margin_series, errors="coerce").dropna()
-        if len(m) >= 20 and m.iloc[-20] > 0:
-            m_chg_series = m.pct_change(20) * 100.0
-            margin_chg_pct = round(float(m_chg_series.iloc[-1]), 1)
-            margin_z = _latest_rolling_zscore(m_chg_series, window=60, min_periods=20)
-
-    z_txt = f"（乖離 Z={vwap_z:+.1f}σ" + (f" / 融資 Z={margin_z:+.1f}σ）" if margin_z is not None else "）") if vwap_z is not None else ""
-
-    if price_vs_vwap_pct is None or margin_chg_pct is None:
-        return ChipPainReport(
-            status="暫無融資資料",
-            risk_adj=0.0,
-            vwap_20=round(vwap_20, 2),
-            price_vs_vwap_pct=price_vs_vwap_pct,
-            vwap_zscore_60d=vwap_z,
-            note=f"無法取得完整 20 日融資餘額；現價距20日均價 {_fmt_num(price_vs_vwap_pct, '%', signed=True)}{z_txt}",
-        )
-
-    # 多殺多預警：符合傳統絕對門檻 OR 自適應雙邊異常（融資激增 >= +1.5σ 且跌破均價 <= -1.5σ）
-    is_classic_squeeze = (margin_chg_pct >= 10.0 and price_vs_vwap_pct <= -8.0)
-    is_adaptive_squeeze = (
-        margin_z is not None and vwap_z is not None
-        and margin_z >= 1.5 and vwap_z <= -1.5 and price_vs_vwap_pct <= -2.5
+    z_txt = (
+        f"（乖離 Z={v_z:+.1f}σ" + (f" / 融資 Z={m_z:+.1f}σ）" if m_z is not None else "）")
+        if v_z is not None else ""
     )
-    if is_classic_squeeze or is_adaptive_squeeze:
-        trigger_lbl = "自適應異常" if (is_adaptive_squeeze and not is_classic_squeeze) else "槓桿套牢"
-        return ChipPainReport(
-            status="多殺多預警",
-            risk_adj=15.0,
-            vwap_20=round(vwap_20, 2),
-            price_vs_vwap_pct=price_vs_vwap_pct,
-            margin_chg_20d_pct=margin_chg_pct,
-            vwap_zscore_60d=vwap_z,
-            margin_zscore_60d=margin_z,
-            note=f"【{trigger_lbl}】近20日融資 {margin_chg_pct:+.1f}%，現價低於20日均價 {price_vs_vwap_pct:.1f}%{z_txt}，留意斷頭賣壓",
-        )
 
-    # 籌碼乾淨度：符合傳統絕對門檻 OR 自適應沉澱（融資顯著收斂 <= -1.0σ 且站穩均價之上 >= +0.5σ）
-    is_classic_clean = (margin_chg_pct <= -5.0 and price_vs_vwap_pct >= 0.0)
-    is_adaptive_clean = (
-        margin_z is not None and vwap_z is not None
-        and margin_z <= -1.0 and vwap_z >= 0.5 and price_vs_vwap_pct >= 0.0
-    )
-    if is_classic_clean or is_adaptive_clean:
-        return ChipPainReport(
-            status="籌碼乾淨",
-            risk_adj=-10.0,
-            vwap_20=round(vwap_20, 2),
-            price_vs_vwap_pct=price_vs_vwap_pct,
-            margin_chg_20d_pct=margin_chg_pct,
-            vwap_zscore_60d=vwap_z,
-            margin_zscore_60d=margin_z,
-            note=f"近20日融資減少 {margin_chg_pct:+.1f}% 且站穩20日均價 ({price_vs_vwap_pct:+.1f}%){z_txt}，下檔支撐強",
+    if status == "暫無融資資料":
+        note = f"無法取得完整 20 日融資餘額；現價距20日均價 {_fmt_num(p_vs_v, '%', signed=True)}{z_txt}"
+    elif status == "多殺多預警":
+        note = (
+            f"【{trigger or '槓桿套牢'}】近20日融資 {_fmt_num(m_chg, '%', signed=True)}，"
+            f"現價低於20日均價 {_fmt_num(p_vs_v, '%')}{z_txt}，留意斷頭賣壓"
+        )
+    elif status == "籌碼乾淨":
+        note = (
+            f"近20日融資減少 {_fmt_num(m_chg, '%', signed=True)} 且站穩20日均價 "
+            f"({_fmt_num(p_vs_v, '%', signed=True)}){z_txt}，下檔支撐強"
+        )
+    else:
+        note = (
+            f"現價距20日均價 {_fmt_num(p_vs_v, '%', signed=True)}，"
+            f"近20日融資變動 {_fmt_num(m_chg, '%', signed=True)}{z_txt}"
         )
 
     return ChipPainReport(
-        status="中性正常",
-        risk_adj=0.0,
-        vwap_20=round(vwap_20, 2),
-        price_vs_vwap_pct=price_vs_vwap_pct,
-        margin_chg_20d_pct=margin_chg_pct,
-        vwap_zscore_60d=vwap_z,
-        margin_zscore_60d=margin_z,
-        note=f"現價距20日均價 {price_vs_vwap_pct:+.1f}%，近20日融資變動 {margin_chg_pct:+.1f}%{z_txt}",
+        status=status,
+        risk_adj=risk_adj,
+        vwap_20=vwap_20,
+        price_vs_vwap_pct=p_vs_v,
+        margin_chg_20d_pct=m_chg,
+        vwap_zscore_60d=v_z,
+        margin_zscore_60d=m_z,
+        note=note,
     )
 
 
-def compute_downside_alpha(
+def compute_downside_alpha_series(
     stock_df: pd.DataFrame,
     twii_df: pd.DataFrame,
     inst_net_shares_series: Optional[pd.Series] = None,
     lookback_days: int = 60,
-) -> DownsideAlphaReport:
+) -> pd.DataFrame:
     """
-    4. 逆風韌性係數 (Downside Alpha)：
-    掃描近 60 個交易日中「加權指數單日跌幅 <= -1%」的日子，計算個股平均報酬與法人淨買超張數。
+    向量化逐日逆風韌性係數（無前視偏誤）：
+    每個交易日 t 僅回看 [t - lookback_days + 1, t] 中「加權指數單日跌逾 1%」之交易日。
     """
+    idx = twii_df.index
     if stock_df is None or twii_df is None or stock_df.empty or twii_df.empty:
-        return DownsideAlphaReport(has_badge=False, note="大盤或個股歷史價格不足")
-    s_ret = stock_df["Close"].pct_change() * 100.0
-    m_ret = twii_df["Close"].pct_change() * 100.0
-    aligned = pd.concat([s_ret.rename("stock"), m_ret.rename("twii")], axis=1).dropna().tail(lookback_days)
-    down_days = aligned[aligned["twii"] <= -1.0]
-    cnt = len(down_days)
-    if cnt == 0:
-        return DownsideAlphaReport(has_badge=False, down_days_count=0, note="近 60 日無大盤單日跌逾 1% 之交易日")
-    avg_s = round(float(down_days["stock"].mean()), 2)
-    avg_m = round(float(down_days["twii"].mean()), 2)
-    avg_inst_lots = None
+        return pd.DataFrame(
+            {
+                "down_days_count": 0,
+                "avg_stock_ret_pct": np.nan,
+                "avg_twii_ret_pct": np.nan,
+                "avg_inst_net_lots": np.nan,
+                "has_badge": 0,
+                "resilience_bonus": 0.0,
+            },
+            index=idx,
+        )
+
+    s_close = pd.to_numeric(stock_df["Close"], errors="coerce").reindex(idx)
+    m_close = pd.to_numeric(twii_df["Close"], errors="coerce")
+    s_ret = _safe_pct_change(s_close, periods=1) * 100.0
+    m_ret = _safe_pct_change(m_close, periods=1) * 100.0
+
+    is_down = ((m_ret <= -1.0) & s_ret.notna() & m_ret.notna()).astype(float)
+    down_cnt = is_down.rolling(lookback_days, min_periods=1).sum()
+    safe_cnt = down_cnt.where(down_cnt > 0.0)
+
+    avg_s = (s_ret.where(is_down == 1.0, 0.0)).rolling(lookback_days, min_periods=1).sum() / safe_cnt
+    avg_m = (m_ret.where(is_down == 1.0, 0.0)).rolling(lookback_days, min_periods=1).sum() / safe_cnt
+
     if inst_net_shares_series is not None and not inst_net_shares_series.empty:
-        inst_aligned = inst_net_shares_series.reindex(down_days.index).dropna()
-        if not inst_aligned.empty:
-            avg_inst_lots = round(float(inst_aligned.mean()) / 1000.0, 1)
-    is_resilient = cnt >= 2 and (
-        avg_s > 0.0
-        or (avg_inst_lots is not None and avg_inst_lots > 0.0 and (avg_s - avg_m) >= 1.0)
+        inst_raw = pd.to_numeric(inst_net_shares_series, errors="coerce")
+        inst_raw = inst_raw[~inst_raw.index.duplicated(keep="last")].sort_index()
+        inst_lots = inst_raw.reindex(idx) / 1000.0
+        inst_valid_down = ((is_down == 1.0) & inst_lots.notna()).astype(float)
+        inst_cnt = inst_valid_down.rolling(lookback_days, min_periods=1).sum()
+        avg_inst = (
+            inst_lots.where(inst_valid_down == 1.0, 0.0).rolling(lookback_days, min_periods=1).sum()
+            / inst_cnt.where(inst_cnt > 0.0)
+        )
+    else:
+        avg_inst = pd.Series(np.nan, index=idx, dtype=float)
+
+    cond_pos_ret = avg_s > 0.0
+    cond_inst_defend = avg_inst.notna() & (avg_inst > 0.0) & ((avg_s - avg_m) >= 1.0)
+    has_badge = ((down_cnt >= 2.0) & (cond_pos_ret | cond_inst_defend)).astype(int)
+    resilience_bonus = np.where(has_badge == 1, -5.0, 0.0)
+
+    return pd.DataFrame(
+        {
+            "down_days_count": down_cnt.fillna(0).astype(int),
+            "avg_stock_ret_pct": avg_s.round(2),
+            "avg_twii_ret_pct": avg_m.round(2),
+            "avg_inst_net_lots": avg_inst.round(1),
+            "has_badge": has_badge,
+            "resilience_bonus": resilience_bonus.astype(float),
+        },
+        index=idx,
     )
-    inst_txt = f"，法人逆風日均買超 {avg_inst_lots:+.0f} 張" if avg_inst_lots is not None else ""
-    note = f"近60日大盤大跌共 {cnt} 天（均跌 {avg_m:.2f}%），本股均表現 {avg_s:+.2f}%{inst_txt}"
+
+
+def _extract_latest_downside_report(downside_df: pd.DataFrame) -> DownsideAlphaReport:
+    """從逐日逆風韌性表中提取最新一日摘要報告"""
+    if downside_df is None or downside_df.empty:
+        return DownsideAlphaReport(has_badge=False, note="大盤或個股歷史價格不足")
+
+    last = downside_df.iloc[-1]
+    cnt = int(last.get("down_days_count", 0))
+    if cnt == 0:
+        return DownsideAlphaReport(
+            has_badge=False,
+            down_days_count=0,
+            note="近 60 日無大盤單日跌逾 1% 之交易日",
+        )
+
+    avg_s = _safe_float(last.get("avg_stock_ret_pct"))
+    avg_m = _safe_float(last.get("avg_twii_ret_pct"))
+    avg_inst = _safe_float(last.get("avg_inst_net_lots"))
+    has_badge = bool(int(last.get("has_badge", 0)) == 1)
+
+    inst_txt = f"，法人逆風日均買超 {avg_inst:+.0f} 張" if avg_inst is not None else ""
+    note = (
+        f"近60日大盤大跌共 {cnt} 天（均跌 {_fmt_num(avg_m, '%')}），"
+        f"本股均表現 {_fmt_num(avg_s, '%', signed=True)}{inst_txt}"
+    )
     return DownsideAlphaReport(
-        has_badge=is_resilient,
+        has_badge=has_badge,
         down_days_count=cnt,
         avg_stock_ret_pct=avg_s,
         avg_twii_ret_pct=avg_m,
-        avg_inst_net_lots=avg_inst_lots,
+        avg_inst_net_lots=avg_inst,
         note=note,
     )
 
 
 def evaluate_sri_velocity(base_sri_history: List[float]) -> Tuple[float, str, float]:
     """
-    5. 風險加速度 (SRI Velocity / 二階斜率)：
-    追蹤近 3 個交易日的風險變化速度：
-    - 急升 (>= +10 分)：判定「加速惡化」，提前加罰 +3 ~ +6 分預警
-    - 緩升 (>= +5 分)：判定「緩步升溫」，加罰 +2 分
-    - 急降 (<= -8 分)：判定「風險收斂」，給予 -3 分正向轉折緩解
+    風險加速度 (SRI Velocity / 二階斜率)：
+    追蹤近 3 個交易日的風險變化速度並給予提前預警或正向收斂微調。
     """
     if len(base_sri_history) < 4:
         return 0.0, "平穩", 0.0
@@ -534,16 +656,16 @@ def compute_active_alpha_and_quadrant(
     downside_report: DownsideAlphaReport,
 ) -> ActiveAlphaReport:
     """
-    6. 主動式進攻因子 (Active Alpha Score) 與四象限分類：
-    三大主動訊號：
-    (A) 相對大盤強弱動能 (RS Momentum)：RS 比值距 20 日均線乖離、是否創 60 日新高
-    (B) 波動率壓縮突破 (Volatility Squeeze & Breakout)：ATR 10/60 壓縮後帶量站上 VWAP
-    (C) 法人低檔吸納與二階轉折 (Stealth Accumulation & Flow Inflection)：股價未大漲時法人連買，或由賣轉買
+    主動式進攻因子 (Active Alpha Score) 與四象限分類：
+    結合相對大盤強弱動能 (RS)、波動率壓縮突破 (ATR Squeeze) 與法人低檔吸納轉折。
     """
     if df is None or len(df) < 25:
         return ActiveAlphaReport(
-            alpha_score=50, rating="溫和蓄勢", quadrant="🛡️ 防禦盤整",
-            quadrant_badge_cls="badge-blue", quadrant_desc="歷史交易日不足，暫以中性基準顯示",
+            alpha_score=50,
+            rating="溫和蓄勢",
+            quadrant="🛡️ 防禦盤整",
+            quadrant_badge_cls="badge-blue",
+            quadrant_desc="歷史交易日不足，暫以中性基準顯示",
             signals=["交易日資料尚不足以計算完整主動動能"],
         )
 
@@ -551,7 +673,6 @@ def compute_active_alpha_and_quadrant(
     score = 45.0
     signals: List[str] = []
 
-    # (A) 相對強弱動能 (RS = 個股 / 加權指數)
     rs_vs_ma20 = _safe_float(last.get("rs_vs_ma20_pct"))
     rs_new_high = bool(last.get("rs_new_high_60d", 0) == 1)
     if rs_new_high:
@@ -567,7 +688,6 @@ def compute_active_alpha_and_quadrant(
         elif rs_vs_ma20 < -1.0:
             score -= 5.0
 
-    # (B) 波動率壓縮與帶量點火 (ATR 10 / ATR 60)
     sq_ratio = _safe_float(last.get("vol_squeeze_ratio"))
     min_sq_5d = _safe_float(last.get("min_sq_5d"))
     vol_ratio = _safe_float(last.get("stk_vol_ratio_20"))
@@ -597,7 +717,6 @@ def compute_active_alpha_and_quadrant(
         score -= 9.0
         signals.append("近期量縮橫盤、缺乏資金表態（防範死魚盤）")
 
-    # (C) 法人低檔吸納度 & 二階賣壓轉折
     is_stealth_accum = False
     if sm_5d is not None:
         if sm_5d >= 3.0 and -3.5 <= ret_10d <= 6.5:
@@ -614,7 +733,6 @@ def compute_active_alpha_and_quadrant(
             score -= 12.0
             signals.append(f"法人近 5 日呈現明顯調節（佔量 {sm_5d:+.1f}%）")
     else:
-        # 無法人明細時改以資金流量 CMF 代理主動買盤
         if cmf_10 >= 0.14:
             score += 10.0
             signals.append("價量資金流向 (CMF) 呈現主動淨流入")
@@ -622,7 +740,6 @@ def compute_active_alpha_and_quadrant(
             score -= 10.0
             signals.append("價量資金流向 (CMF) 呈現資金流出")
 
-    # (D) 未來展望與逆風韌性共振加成
     if outlook_score >= 65:
         score += 6.0
     if downside_report.has_badge:
@@ -637,7 +754,6 @@ def compute_active_alpha_and_quadrant(
         "動能偏弱" if alpha_int >= 32 else "資金退潮"
     )
 
-    # 四象限決策判定（橫軸：主動 Alpha 門檻 60；縱軸：風控 SRI 門檻 52）
     low_risk = latest_sri < 52
     high_alpha = alpha_int >= 60
     if low_risk and high_alpha:
@@ -671,14 +787,14 @@ def compute_active_alpha_and_quadrant(
 # =========================================================
 # 後台消息面與資料擷取層（附 Streamlit 雲端快取）
 # =========================================================
-BEARISH_KW = {
+BEARISH_KW: Dict[str, float] = {
     "升息": 3.0, "通膨": 2.5, "關稅": 3.0, "制裁": 2.5, "禁令": 2.5,
     "重挫": 3.0, "崩跌": 3.5, "暴跌": 3.5, "斷頭": 3.5, "衰退": 3.0,
     "停滯": 2.5, "戰爭": 3.0, "衝突": 2.5, "賣超": 2.0, "提款": 2.0,
     "緊縮": 2.5, "鷹派": 2.5, "下修": 2.0, "恐慌": 2.5, "破底": 2.5,
     "大跌": 2.5, "利空": 2.0, "匯出": 2.0,
 }
-BULLISH_KW = {
+BULLISH_KW: Dict[str, float] = {
     "降息": 3.0, "鴿派": 2.5, "寬鬆": 2.5, "創高": 2.0, "買超": 2.0,
     "回補": 2.0, "強彈": 2.0, "大漲": 2.0, "利多": 2.0, "資本支出": 2.0,
     "擴產": 2.0, "和談": 2.5, "停火": 3.0, "上修": 2.0, "優於預期": 2.5,
@@ -733,20 +849,25 @@ def fetch_news_risk_score(stock_id: str = "") -> float:
 
 
 def _fetch_yf(symbol: str, start: str, end: str) -> pd.DataFrame:
-    """封裝 yfinance 歷史行情擷取並統一時區為無時區日期索引"""
+    """封裝 yfinance 歷史行情擷取，統一去重排序與無時區日期索引"""
     try:
         df = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True)
         if df is None or df.empty:
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        return df
+        return _dedup_sort_index(df)
     except Exception:
         return pd.DataFrame()
 
 
-def _finmind_get(dataset: str, start: str, end: str, token: str, data_id: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
+def _finmind_get(
+    dataset: str,
+    start: str,
+    end: str,
+    token: str,
+    data_id: Optional[str] = None,
+) -> Tuple[pd.DataFrame, str]:
     """封裝 FinMind v4 REST API 查詢並回傳 (DataFrame, 狀態訊息)"""
     params = {"dataset": dataset, "start_date": start, "end_date": end}
     if data_id:
@@ -773,10 +894,10 @@ def fetch_shared_market_data(fetch_start: str, end: str, fm_start: str, token: s
         "NDX": "^IXIC", "SOX": "^SOX", "TNX": "^TNX", "USDTWD": "TWD=X",
         "GOLD": "GC=F", "OIL": "CL=F", "BTC": "BTC-USD", "VIX": "^VIX",
     }
-    macro_data = {}
+    macro_data: Dict[str, pd.DataFrame] = {}
     for k, sym in macro_tickers.items():
         d = _fetch_yf(sym, fetch_start, end)
-        if k == "TNX" and not d.empty and d["Close"].median() > 20:
+        if k == "TNX" and not d.empty and "Close" in d and d["Close"].median() > 20:
             d["Close"] = d["Close"] / 10.0
         macro_data[k] = d
 
@@ -791,6 +912,7 @@ def fetch_shared_market_data(fetch_start: str, end: str, fm_start: str, token: s
             sub = df_tm[df_tm["name"] == "MarginPurchase"]
         if not sub.empty:
             s = sub.set_index("date")["TodayBalance"].apply(pd.to_numeric, errors="coerce")
+            s = s[~s.index.duplicated(keep="last")].sort_index()
             frames.append(s.rename("mkt_margin_bal").to_frame())
 
     df_ti, st2 = _finmind_get("TaiwanStockTotalInstitutionalInvestors", fm_start, end, token)
@@ -804,23 +926,27 @@ def fetch_shared_market_data(fetch_start: str, end: str, fm_start: str, token: s
         ) / 1e8
         piv = df_ti.pivot_table(index="date", columns="name", values="net_b", aggfunc="sum").fillna(0)
         if "Foreign_Investor" in piv:
-            frames.append(piv[["Foreign_Investor"]].rename(columns={"Foreign_Investor": "mkt_foreign_net_b"}))
+            frames.append(_dedup_sort_index(piv[["Foreign_Investor"]].rename(columns={"Foreign_Investor": "mkt_foreign_net_b"})))
 
-    mkt_chips = pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+    mkt_chips = _dedup_sort_index(pd.concat(frames, axis=1)) if frames else pd.DataFrame()
     return twii, macro_data, mkt_chips, mkt_status
 
 
 def fetch_fundamentals_and_outlook_smart(
-    clean_id: str, resolved_sym: str, latest_close: float, latest_dd_20d: float, token: str
+    clean_id: str,
+    resolved_sym: str,
+    latest_close: float,
+    latest_dd_20d: float,
+    token: str,
 ) -> Tuple[FundamentalQualityReport, ForwardOutlookReport, str]:
     """
     智慧基本面＋未來展望擷取（Yahoo Finance + FinMind 雙重備援）：
     - 修正賣方目標價樂觀偏誤，股價深跌時自動折價防範滯後陷阱
-    - 僅在成功抓到真實數據時寫入 session_state 快取 30 分鐘；若全為空值則不快取
+    - 僅在成功抓到真實數據時寫入 session_state 快取 30 分鐘
     """
     if "fund_outlook_cache" not in st.session_state:
         st.session_state["fund_outlook_cache"] = {}
-    cache_key = f"{clean_id}_{bool(token)}_v101"
+    cache_key = f"{clean_id}_{bool(token)}_v102"
     cached = st.session_state["fund_outlook_cache"].get(cache_key)
     if cached and (time.time() - cached["ts"] < 1800):
         return cached["quality"], cached["outlook"], cached["yf_name"]
@@ -830,7 +956,7 @@ def fetch_fundamentals_and_outlook_smart(
     analyst_cnt = None
     rev_accel = None
     yf_name = ""
-    used_sources = []
+    used_sources: List[str] = []
 
     try:
         info = yf.Ticker(resolved_sym).info or {}
@@ -911,7 +1037,8 @@ def fetch_fundamentals_and_outlook_smart(
 
     # 評分 A：歷史財務體質健檢
     q_score = 52
-    q_strengths, q_warns = [], []
+    q_strengths: List[str] = []
+    q_warns: List[str] = []
     if roe is not None:
         if roe >= 15.0:
             q_score += 14
@@ -964,23 +1091,29 @@ def fetch_fundamentals_and_outlook_smart(
         "C 高估值/轉弱" if q_score >= 38 else "D 體質偏弱"
     )
     quality = FundamentalQualityReport(
-        quality_score=q_score, risk_equivalent=float(100 - q_score), rating=q_rating,
-        pe=pe, pb=pb, roe_pct=roe, op_margin_pct=op_m, rev_growth_pct=rev_g,
+        quality_score=q_score,
+        risk_equivalent=float(100 - q_score),
+        rating=q_rating,
+        pe=pe,
+        pb=pb,
+        roe_pct=roe,
+        op_margin_pct=op_m,
+        rev_growth_pct=rev_g,
         source_note=" + ".join(used_sources) if used_sources else "暫無資料",
         strengths=q_strengths if q_strengths else ["財務結構大致符合產業平均水準"],
         warnings=q_warns,
     )
 
-    # 評分 B：未來展望與法人預期（v10.1 嚴格校準：修正賣方樂觀偏誤、極端值封頂與深跌現實鎖定）
+    # 評分 B：未來展望與法人預期（修正賣方樂觀偏誤、極端值封頂與深跌現實鎖定）
     o_score = 45.0
-    o_strengths, o_warns = [], []
+    o_strengths: List[str] = []
+    o_warns: List[str] = []
     implied_eps_g = None
     target_upside = None
     is_deep_pullback = pd.notna(latest_dd_20d) and latest_dd_20d <= -12.0
     is_severe_crash = pd.notna(latest_dd_20d) and latest_dd_20d <= -15.0
     strong_eps = strong_tgt = strong_rev = False
 
-    # 因子 1：預估獲利成長 (Trailing PE / Forward PE - 1)
     if trailing_pe is not None and forward_pe is not None and trailing_pe > 0 and forward_pe > 0:
         implied_eps_g = round((trailing_pe / forward_pe - 1.0) * 100.0, 1)
         if implied_eps_g > 150.0:
@@ -1005,13 +1138,13 @@ def fetch_fundamentals_and_outlook_smart(
             o_score -= 7.0
             o_warns.append(f"預估獲利微幅下修 ({implied_eps_g:+.1f}%)")
 
-    # 因子 2：外資／分析師共識目標價空間（扣除賣方常態樂觀偏誤，深跌時完全不予加分）
     if target_mean is not None and latest_close > 0:
         target_upside = round((target_mean / latest_close - 1.0) * 100.0, 1)
         cnt_txt = f"({analyst_cnt}家機構)" if analyst_cnt else ""
         if target_upside >= 10.0 and is_deep_pullback:
             o_warns.append(
-                f"法人目標價 {target_mean:.1f} 元{cnt_txt} 雖顯示 {target_upside:+.1f}% 空間，但近月已回檔 {latest_dd_20d:.1f}%，防範滯後下修（暫不計入加分）"
+                f"法人目標價 {target_mean:.1f} 元{cnt_txt} 雖顯示 {target_upside:+.1f}% 空間，"
+                f"但近月已回檔 {latest_dd_20d:.1f}%，防範滯後下修（暫不計入加分）"
             )
         elif target_upside > 80.0:
             o_score += 6.0
@@ -1035,7 +1168,6 @@ def fetch_fundamentals_and_outlook_smart(
             o_score -= 7.0
             o_warns.append(f"現價逼近法人目標價 {target_mean:.1f} 元 ({target_upside:+.1f}%)")
 
-    # 因子 3：營收動能加速度（近 3 月均營收 vs 近 12 月均營收，硬數據維持較高權重）
     if rev_accel is not None:
         if rev_accel >= 20.0:
             o_score += 13.0
@@ -1054,12 +1186,10 @@ def fetch_fundamentals_and_outlook_smart(
             o_score -= 7.0
             o_warns.append(f"近 3 月營收略低於年均 ({rev_accel:+.1f}%)")
 
-    # 三因子健康共振加成：唯有三項指標同步達標且股價未深跌才給予共振分數
     if strong_eps and strong_tgt and strong_rev and pd.notna(latest_dd_20d) and latest_dd_20d > -8.0:
         o_score += 6.0
         o_strengths.append("獲利預估、法人目標與營收加速三因子健康共振")
 
-    # 價格重挫現實校準：當股價急殺時，強制壓抑展望分數避免與盤面嚴重脫節
     if is_severe_crash:
         o_score = min(o_score - 10.0, 64.0)
         o_warns.append(f"近月重挫 {latest_dd_20d:.1f}%，價格走勢與基本面預期背離，已強制壓抑展望上限（止穩前不評偏多）")
@@ -1080,9 +1210,15 @@ def fetch_fundamentals_and_outlook_smart(
         "動能轉弱" if o_score_int >= 35 else "保守偏空"
     )
     outlook = ForwardOutlookReport(
-        outlook_score=o_score_int, risk_equivalent=float(100 - o_score_int), rating=o_rating,
-        trailing_pe=trailing_pe, forward_pe=forward_pe, implied_eps_growth_pct=implied_eps_g,
-        target_mean_price=target_mean, target_upside_pct=target_upside, analyst_count=analyst_cnt,
+        outlook_score=o_score_int,
+        risk_equivalent=float(100 - o_score_int),
+        rating=o_rating,
+        trailing_pe=trailing_pe,
+        forward_pe=forward_pe,
+        implied_eps_growth_pct=implied_eps_g,
+        target_mean_price=target_mean,
+        target_upside_pct=target_upside,
+        analyst_count=analyst_cnt,
         rev_accel_pct=rev_accel,
         strengths=o_strengths if o_strengths else ["各項前瞻動能指標目前維持中性水準"],
         warnings=o_warns,
@@ -1116,6 +1252,7 @@ def fetch_single_stock_price_and_chips(stock_id: str, fetch_start: str, end: str
     if not df_m.empty:
         df_m["date"] = pd.to_datetime(df_m["date"])
         df_m = df_m.set_index("date")
+        df_m = df_m[~df_m.index.duplicated(keep="last")].sort_index()
         m_out = pd.DataFrame(index=df_m.index)
         m_out["margin_bal"] = pd.to_numeric(df_m.get("MarginPurchaseTodayBalance"), errors="coerce")
         m_out["short_bal"] = pd.to_numeric(df_m.get("ShortSaleTodayBalance"), errors="coerce").fillna(0)
@@ -1136,21 +1273,24 @@ def fetch_single_stock_price_and_chips(stock_id: str, fetch_start: str, end: str
             - pd.to_numeric(df_i["sell"], errors="coerce").fillna(0)
         )
         piv = df_i.pivot_table(index="date", columns="name", values="net", aggfunc="sum").fillna(0)
+        piv = _dedup_sort_index(piv)
         i_out = pd.DataFrame(index=piv.index)
         i_out["foreign_net"] = piv["Foreign_Investor"] if "Foreign_Investor" in piv else 0.0
         i_out["trust_net"] = piv["Investment_Trust"] if "Investment_Trust" in piv else 0.0
         i_out["smart_money_net"] = i_out["foreign_net"] + i_out["trust_net"]
         frames.append(i_out)
 
-    stk_chips = pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+    stk_chips = _dedup_sort_index(pd.concat(frames, axis=1)) if frames else pd.DataFrame()
     return stk, resolved_sym, clean_id, stk_chips, stk_status
 
 
 # =========================================================
-# v10.0 核心量化風控＋主動式雙軸運算引擎
+# v10.2 核心量化風控＋主動式雙軸運算引擎（無前視偏誤版）
 # =========================================================
 class InstitutionalQuantRiskEngine:
-    """台股量化風控與主動進攻雙軸引擎（v10.0：動態 Beta、Z-Score、風險加速度、主動 Alpha、四象限）"""
+    """台股量化風控與主動進攻雙軸引擎（v10.2：逐日滾動 Beta / 籌碼痛點 / 逆風韌性 / 美股跨日 PIT 對齊）"""
+
+    US_SHIFT_KEYS = {"SOX", "NDX", "TNX", "GOLD", "OIL", "VIX"}
 
     def __init__(self, config: Optional[RiskModelConfig] = None):
         self.cfg = config or RiskModelConfig()
@@ -1160,28 +1300,26 @@ class InstitutionalQuantRiskEngine:
 
     def score_market_snapshot(self, row: pd.Series, news_risk_score: float = 50.0) -> float:
         """計算單日大盤系統風險快照分數（0~100）"""
-        # 1) 美股科技與費城半導體動能
         s_us = 45.0
-        sox_5d, sox_10d = row.get("sox_5d_pct", 0.0), row.get("sox_10d_pct", 0.0)
-        ndx_5d, ndx_10d = row.get("ndx_5d_pct", 0.0), row.get("ndx_10d_pct", 0.0)
+        sox_5d, sox_10d = row.get("sox_5d_pct", np.nan), row.get("sox_10d_pct", np.nan)
+        ndx_5d, ndx_10d = row.get("ndx_5d_pct", np.nan), row.get("ndx_10d_pct", np.nan)
         if pd.notna(sox_10d):
-            if sox_10d <= -8.0 or sox_5d <= -5.5:
+            if sox_10d <= -8.0 or (pd.notna(sox_5d) and sox_5d <= -5.5):
                 s_us += 38
-            elif sox_10d <= -4.0 or sox_5d <= -3.0:
+            elif sox_10d <= -4.0 or (pd.notna(sox_5d) and sox_5d <= -3.0):
                 s_us += 22
-            elif sox_10d >= 5.0 and ndx_10d >= 2.5:
+            elif sox_10d >= 5.0 and pd.notna(ndx_10d) and ndx_10d >= 2.5:
                 s_us -= 20
         if pd.notna(ndx_10d):
-            if ndx_10d <= -4.5 or ndx_5d <= -3.0:
+            if ndx_10d <= -4.5 or (pd.notna(ndx_5d) and ndx_5d <= -3.0):
                 s_us += 18
             elif ndx_10d >= 3.0:
                 s_us -= 8
         s_us = float(np.clip(s_us, 5, 100))
 
-        # 2) 美債殖利率與新台幣匯率
         s_rf = 42.0
         tnx, tnx_20d = row.get("tnx_close", np.nan), row.get("tnx_20d_chg", np.nan)
-        twd_10d = row.get("usdtwd_10d_pct", 0.0)
+        twd_10d = row.get("usdtwd_10d_pct", np.nan)
         if pd.notna(tnx):
             s_rf += 35 if tnx >= 4.95 else (18 if tnx >= 4.65 else (-15 if tnx <= 4.10 else 0))
             if pd.notna(tnx_20d) and tnx_20d >= 0.30:
@@ -1190,11 +1328,10 @@ class InstitutionalQuantRiskEngine:
             s_rf += 16 if twd_10d >= 1.0 else (-12 if twd_10d <= -0.8 else 0)
         s_rf = float(np.clip(s_rf, 5, 100))
 
-        # 3) 台股大盤籌碼與位階
         s_tw = 42.0
         m_rank, m_5d = row.get("mkt_margin_rank_60d", np.nan), row.get("mkt_margin_5d_pct", np.nan)
         f_5d, f_10d = row.get("mkt_foreign_5d_b", np.nan), row.get("mkt_foreign_10d_b", np.nan)
-        bias_60 = row.get("twii_bias_60", 0.0)
+        bias_60 = row.get("twii_bias_60", np.nan)
         if pd.notna(m_rank) or pd.notna(f_10d):
             if pd.notna(m_rank):
                 s_tw += 18 if m_rank >= 0.88 else (9 if m_rank >= 0.78 else 0)
@@ -1211,7 +1348,7 @@ class InstitutionalQuantRiskEngine:
                 elif pd.notna(f_5d) and f_5d >= 150:
                     s_tw -= 14
         else:
-            twii_dd, twii_hv = row.get("twii_dd_60d", 0.0), row.get("twii_hv_20", 15.0)
+            twii_dd, twii_hv = row.get("twii_dd_60d", np.nan), row.get("twii_hv_20", np.nan)
             if pd.notna(twii_dd) and twii_dd <= -12.0:
                 s_tw += 24
             elif pd.notna(twii_dd) and twii_dd <= -6.0:
@@ -1226,10 +1363,9 @@ class InstitutionalQuantRiskEngine:
             s_tw += 11
         s_tw = float(np.clip(s_tw, 5, 100))
 
-        # 4) 原油與黃金
         s_cmd = 45.0
-        oil_10d, oil_c = row.get("oil_10d_pct", 0.0), row.get("oil_close", 70.0)
-        gold_10d = row.get("gold_10d_pct", 0.0)
+        oil_10d, oil_c = row.get("oil_10d_pct", np.nan), row.get("oil_close", np.nan)
+        gold_10d = row.get("gold_10d_pct", np.nan)
         if pd.notna(oil_10d):
             if oil_10d >= 10.0 or (pd.notna(oil_c) and oil_c >= 92.0):
                 s_cmd += 28
@@ -1243,9 +1379,8 @@ class InstitutionalQuantRiskEngine:
             s_cmd += 18 if gold_10d >= 5.0 else (-6 if gold_10d <= -3.0 else 0)
         s_cmd = float(np.clip(s_cmd, 10, 100))
 
-        # 5) 比特幣流動性風險偏好
         s_btc = 45.0
-        btc_10d = row.get("btc_10d_pct", 0.0)
+        btc_10d = row.get("btc_10d_pct", np.nan)
         if pd.notna(btc_10d):
             if btc_10d <= -12.0:
                 s_btc += 35
@@ -1257,9 +1392,8 @@ class InstitutionalQuantRiskEngine:
                 s_btc -= 10
         s_btc = float(np.clip(s_btc, 10, 100))
 
-        # 6) VIX 與新聞情緒
         s_vix = 42.0
-        vix, vix_5d = row.get("vix_close", 15.0), row.get("vix_5d_pct", 0.0)
+        vix, vix_5d = row.get("vix_close", np.nan), row.get("vix_5d_pct", np.nan)
         if pd.notna(vix):
             if vix >= 26.0:
                 s_vix += 42
@@ -1271,8 +1405,12 @@ class InstitutionalQuantRiskEngine:
         s_sent = s_vix * 0.618 + news_risk_score * 0.382
 
         mri_snap = (
-            s_us * self.w.w_us_tech + s_rf * self.w.w_rates_fx + s_tw * self.w.w_tw_market
-            + s_cmd * self.w.w_commodities + s_btc * self.w.w_btc_liquidity + s_sent * self.w.w_vix_news
+            s_us * self.w.w_us_tech
+            + s_rf * self.w.w_rates_fx
+            + s_tw * self.w.w_tw_market
+            + s_cmd * self.w.w_commodities
+            + s_btc * self.w.w_btc_liquidity
+            + s_sent * self.w.w_vix_news
         )
         return float(np.clip(mri_snap, 0.0, 100.0))
 
@@ -1299,7 +1437,6 @@ class InstitutionalQuantRiskEngine:
 
         if pd.notna(sm_5d):
             score += float(np.clip(-sm_5d * 2.1, -22.0, 26.0))
-        # 二階法人轉折：由顯著賣超收斂轉為淨買超時，提早降低風險分
         if pd.notna(sm_5d) and pd.notna(sm_prev5d):
             if sm_prev5d <= -2.0 and sm_5d > 0.5:
                 score -= 6.0
@@ -1327,27 +1464,23 @@ class InstitutionalQuantRiskEngine:
 
     @staticmethod
     def score_stock_trend_risk(row: pd.Series) -> float:
-        """
-        計算自適應技術趨勢風險分（以個股自身 ATR 正規化乖離與回撤）：
-        讓低波動金融股與高波動電子股各自用自身 ATR 尺度衡量破線嚴重度。
-        """
+        """計算自適應技術趨勢風險分（以個股自身 ATR 正規化乖離與回撤）"""
         close_p = float(row.get("known_stk_close", 0.0))
-        vwap_20 = float(row.get("stk_vwap_20", close_p))
-        atr = float(row.get("stk_atr_14", close_p * 0.025))
+        vwap_20 = _safe_float(row.get("stk_vwap_20"))
+        if vwap_20 is None or vwap_20 <= 0:
+            vwap_20 = close_p
+        atr = _safe_float(row.get("stk_atr_14"))
+        if atr is None or atr <= 0:
+            atr = max(close_p * 0.025, 0.01)
         atr_dd = _safe_float(row.get("stk_atr_norm_dd"))
 
-        if pd.isna(atr) or atr <= 0:
-            atr = max(close_p * 0.025, 0.01)
-
         t_risk = 45.0
-        # 以 ATR 倍數計算現價與 20 日均價距離
         vwap_atr_diff = (close_p - vwap_20) / atr
         if vwap_atr_diff < 0:
             t_risk += min(abs(vwap_atr_diff) * 9.5, 30.0)
         else:
             t_risk -= min(vwap_atr_diff * 5.0, 12.0)
 
-        # 以 ATR 正規化之 20 日高點回撤（超過 3.0 倍 ATR 視為顯著轉弱）
         if atr_dd is not None and atr_dd >= 3.0:
             t_risk += min((atr_dd - 3.0) * 6.0, 20.0)
 
@@ -1374,16 +1507,17 @@ class InstitutionalQuantRiskEngine:
     def _calc_prices(sri_score: int, mri_score: int, combined_score: int, row: pd.Series) -> Tuple[float, float]:
         """依 SRI 風險等級、ATR 波動幅度與基本面/展望綜合分數計算建議賣出價與下檔防守價"""
         close_p = float(row["known_stk_close"])
-        high_15 = float(row.get("stk_high_15d", close_p))
-        atr = float(row.get("stk_atr_14", close_p * 0.025))
-        vwap_20 = float(row.get("stk_vwap_20", close_p))
-        if pd.isna(atr) or atr <= 0:
+        high_15 = _safe_float(row.get("stk_high_15d")) or close_p
+        atr = _safe_float(row.get("stk_atr_14")) or (close_p * 0.025)
+        vwap_20 = _safe_float(row.get("stk_vwap_20")) or close_p
+        if atr <= 0:
             atr = close_p * 0.025
         eff_atr = min(atr, close_p * 0.065)
-        if pd.isna(vwap_20) or vwap_20 <= 0:
+        if vwap_20 <= 0:
             vwap_20 = close_p
-        if pd.isna(high_15) or high_15 < close_p:
+        if high_15 < close_p:
             high_15 = close_p
+
         q_bonus = 0.70 if combined_score >= 72 else (0.25 if combined_score >= 55 else -0.25)
         if sri_score >= 65:
             raw_sell = np.clip(close_p + (1.20 + max(0.0, q_bonus * 0.4)) * eff_atr, close_p * 1.040, close_p * 1.100)
@@ -1397,6 +1531,7 @@ class InstitutionalQuantRiskEngine:
         else:
             raw_sell = np.clip(close_p + (2.80 + q_bonus) * eff_atr, close_p * 1.120, close_p * 1.250)
             raw_stop = np.clip(min(high_15 - 2.65 * eff_atr, close_p - 1.90 * eff_atr), close_p * 0.875, close_p * 0.945)
+
         sell_p = round_tw_tick(float(raw_sell))
         stop_p = round_tw_tick(float(raw_stop))
         if sell_p <= close_p:
@@ -1406,7 +1541,7 @@ class InstitutionalQuantRiskEngine:
         return sell_p, stop_p
 
     def run_analysis(self, stock_id: str, lookback_days: int = 75, fast_batch: bool = False) -> Dict:
-        """執行完整單股或批量雙軸分析，回傳風險指標、主動 Alpha、四象限、價位與歷史序列"""
+        """執行完整單股或批量雙軸分析（全歷史序列無前視偏誤）"""
         today = datetime.date.today()
         fetch_start = (today - datetime.timedelta(days=450)).strftime("%Y-%m-%d")
         fm_start = (today - datetime.timedelta(days=180)).strftime("%Y-%m-%d")
@@ -1417,14 +1552,17 @@ class InstitutionalQuantRiskEngine:
         stk, resolved_sym, clean_id, stk_chips, stk_status = fetch_single_stock_price_and_chips(
             stock_id, fetch_start, end_str, fm_start, token
         )
-        if stk.empty or twii.empty:
+        if stk.empty or twii.empty or "Close" not in stk.columns or "Close" not in twii.columns:
             raise ValueError(f"查無股票代號「{stock_id}」，請確認是否為有效的台股上市／上櫃代碼。")
 
-        stk_close_clean = stk["Close"].dropna()
-        latest_close_val = float(stk_close_clean.iloc[-1])
-        latest_dd_20d = float((stk_close_clean.iloc[-1] / stk_close_clean.tail(20).max() - 1.0) * 100.0)
+        stk_close_clean = pd.to_numeric(stk["Close"], errors="coerce").dropna()
+        if stk_close_clean.empty:
+            raise ValueError(f"股票代號「{stock_id}」缺乏有效收盤價資料。")
 
-        # 查詢歷史財務體質與未來展望（含深跌目標價折價防呆）
+        latest_close_val = float(stk_close_clean.iloc[-1])
+        tail_20_max = float(stk_close_clean.tail(20).max())
+        latest_dd_20d = float((latest_close_val / tail_20_max - 1.0) * 100.0) if tail_20_max > 0 else 0.0
+
         quality, outlook, yf_name = fetch_fundamentals_and_outlook_smart(
             clean_id, resolved_sym, latest_close_val, latest_dd_20d, token
         )
@@ -1436,113 +1574,145 @@ class InstitutionalQuantRiskEngine:
         mkt_note = "真實籌碼" if not mkt_chips.empty else f"備援({mkt_status})"
         stk_note = "真實籌碼" if not stk_chips.empty else f"資金流代理({stk_status})"
 
-        # 對齊大盤與個股日線序列並計算動態與主動技術指標
+        # 對齊大盤與個股日線序列
         df = pd.DataFrame(index=twii.index)
-        twii_c = twii["Close"]
-        stk_h = stk["High"].reindex(df.index).ffill()
-        stk_l = stk["Low"].reindex(df.index).ffill()
-        stk_c = stk["Close"].reindex(df.index).ffill()
-        stk_v = stk["Volume"].reindex(df.index).ffill()
+        twii_c = pd.to_numeric(twii["Close"], errors="coerce")
+        stk_h = pd.to_numeric(stk["High"], errors="coerce").reindex(df.index).ffill()
+        stk_l = pd.to_numeric(stk["Low"], errors="coerce").reindex(df.index).ffill()
+        stk_c = pd.to_numeric(stk["Close"], errors="coerce").reindex(df.index).ffill()
+        stk_v = pd.to_numeric(stk["Volume"], errors="coerce").reindex(df.index).fillna(0.0)
 
         twii_ma60 = twii_c.rolling(60).mean()
         twii_ma240 = twii_c.rolling(240, min_periods=120).mean()
-        df["twii_bias_60"] = (twii_c / twii_ma60 - 1) * 100
+        df["twii_bias_60"] = (twii_c / twii_ma60 - 1.0) * 100.0
         df["twii_below_ma60"] = (twii_c < twii_ma60).astype(int)
         df["twii_below_ma240"] = (twii_c < twii_ma240).astype(int)
-        df["twii_hv_20"] = twii_c.pct_change().rolling(20).std() * np.sqrt(252) * 100
-        df["twii_dd_60d"] = (twii_c / twii_c.rolling(60, min_periods=10).max() - 1) * 100
+        df["twii_hv_20"] = _safe_pct_change(twii_c, 1).rolling(20).std() * np.sqrt(252) * 100.0
+        df["twii_dd_60d"] = (twii_c / twii_c.rolling(60, min_periods=10).max() - 1.0) * 100.0
 
         prev_c = stk_c.shift(1)
         tr = pd.concat([(stk_h - stk_l), (stk_h - prev_c).abs(), (stk_l - prev_c).abs()], axis=1).max(axis=1)
         df["stk_atr_14"] = tr.rolling(14).mean()
         df["stk_atr_10"] = tr.rolling(10).mean()
         df["stk_atr_60"] = tr.rolling(60, min_periods=20).mean()
-        df["vol_squeeze_ratio"] = df["stk_atr_10"] / df["stk_atr_60"].replace(0, np.nan)
+        df["vol_squeeze_ratio"] = df["stk_atr_10"] / df["stk_atr_60"].replace(0.0, np.nan)
         df["min_sq_5d"] = df["vol_squeeze_ratio"].rolling(5, min_periods=1).min()
 
         df["stk_high_15d"] = stk_h.rolling(15).max()
         df["stk_high_20d"] = stk_h.rolling(20, min_periods=5).max()
-        df["stk_atr_norm_dd"] = (df["stk_high_20d"] - stk_c) / df["stk_atr_14"].replace(0, np.nan)
-        df["stk_vwap_20"] = (stk_c * stk_v).rolling(20).sum() / stk_v.rolling(20).sum().replace(0, np.nan)
-        df["stk_vol_ratio_20"] = stk_v / stk_v.rolling(20, min_periods=5).mean().replace(0, np.nan)
-        df["stk_ret_10d"] = stk_c.pct_change(10) * 100.0
+        df["stk_atr_norm_dd"] = (df["stk_high_20d"] - stk_c) / df["stk_atr_14"].replace(0.0, np.nan)
+        df["stk_vol_ratio_20"] = stk_v / stk_v.rolling(20, min_periods=5).mean().replace(0.0, np.nan)
+        df["stk_ret_10d"] = _safe_pct_change(stk_c, 10) * 100.0
 
         # 相對大盤強弱指標 (RS Momentum)
-        rs_line = stk_c / twii_c.replace(0, np.nan)
+        rs_line = stk_c / twii_c.replace(0.0, np.nan)
         rs_ma20 = rs_line.rolling(20).mean()
         rs_high60 = rs_line.rolling(60, min_periods=20).max()
         df["rs_vs_ma20_pct"] = (rs_line / rs_ma20 - 1.0) * 100.0
         df["rs_new_high_60d"] = (rs_line >= rs_high60 * 0.995).astype(int)
 
-        hl_range = (stk_h - stk_l).replace(0, np.nan)
+        hl_range = (stk_h - stk_l).replace(0.0, np.nan)
         mfm = (((stk_c - stk_l) - (stk_h - stk_c)) / hl_range).fillna(0.0)
-        df["stk_cmf_10"] = (mfm * stk_v).rolling(10).sum() / stk_v.rolling(10).sum().replace(0, np.nan)
-        df["stk_dd_20d"] = (stk_c / stk_c.rolling(20, min_periods=5).max() - 1) * 100
+        df["stk_cmf_10"] = (mfm * stk_v).rolling(10).sum() / stk_v.rolling(10).sum().replace(0.0, np.nan)
+        df["stk_dd_20d"] = (stk_c / stk_c.rolling(20, min_periods=5).max() - 1.0) * 100.0
 
-        def align(k: str) -> pd.Series:
-            """將各總經指標對齊至大盤交易日曆並以昨日收盤前向填補"""
-            return pd.Series(np.nan, index=df.index) if macro_data[k].empty else macro_data[k]["Close"].reindex(df.index, method="ffill")
+        # 總經資料 PIT 對齊：美股收盤日 +1 天後才對台股生效，消除跨時區前視偏誤
+        def align_macro(k: str) -> pd.Series:
+            d_macro = macro_data.get(k)
+            if d_macro is None or d_macro.empty or "Close" not in d_macro.columns:
+                return pd.Series(np.nan, index=df.index, dtype=float)
+            s = pd.to_numeric(d_macro["Close"], errors="coerce").dropna()
+            if s.empty:
+                return pd.Series(np.nan, index=df.index, dtype=float)
+            if k in self.US_SHIFT_KEYS:
+                s = s.copy()
+                s.index = s.index + pd.Timedelta(days=1)
+            return s.reindex(df.index, method="ffill")
 
-        sox, ndx, tnx = align("SOX"), align("NDX"), align("TNX")
-        df["sox_5d_pct"], df["sox_10d_pct"] = sox.pct_change(5) * 100, sox.pct_change(10) * 100
-        df["ndx_5d_pct"], df["ndx_10d_pct"] = ndx.pct_change(5) * 100, ndx.pct_change(10) * 100
+        sox, ndx, tnx = align_macro("SOX"), align_macro("NDX"), align_macro("TNX")
+        df["sox_5d_pct"], df["sox_10d_pct"] = _safe_pct_change(sox, 5) * 100.0, _safe_pct_change(sox, 10) * 100.0
+        df["ndx_5d_pct"], df["ndx_10d_pct"] = _safe_pct_change(ndx, 5) * 100.0, _safe_pct_change(ndx, 10) * 100.0
         df["tnx_close"], df["tnx_20d_chg"] = tnx, tnx - tnx.shift(20)
-        df["usdtwd_10d_pct"] = align("USDTWD").pct_change(10) * 100
-        df["gold_10d_pct"] = align("GOLD").pct_change(10) * 100
-        oil = align("OIL")
-        df["oil_close"], df["oil_10d_pct"] = oil, oil.pct_change(10) * 100
-        df["btc_10d_pct"] = align("BTC").pct_change(10) * 100
-        vix = align("VIX")
-        df["vix_close"], df["vix_5d_pct"] = vix, vix.pct_change(5) * 100
+        df["usdtwd_10d_pct"] = _safe_pct_change(align_macro("USDTWD"), 10) * 100.0
+        df["gold_10d_pct"] = _safe_pct_change(align_macro("GOLD"), 10) * 100.0
+        oil = align_macro("OIL")
+        df["oil_close"], df["oil_10d_pct"] = oil, _safe_pct_change(oil, 10) * 100.0
+        df["btc_10d_pct"] = _safe_pct_change(align_macro("BTC"), 10) * 100.0
+        vix = align_macro("VIX")
+        df["vix_close"], df["vix_5d_pct"] = vix, _safe_pct_change(vix, 5) * 100.0
 
         if not mkt_chips.empty:
             mc = mkt_chips.reindex(df.index).ffill()
             if "mkt_margin_bal" in mc:
                 df["mkt_margin_rank_60d"] = mc["mkt_margin_bal"].rolling(60, min_periods=20).rank(pct=True)
-                df["mkt_margin_5d_pct"] = mc["mkt_margin_bal"].pct_change(5) * 100
+                df["mkt_margin_5d_pct"] = _safe_pct_change(mc["mkt_margin_bal"], 5) * 100.0
             if "mkt_foreign_net_b" in mc:
                 df["mkt_foreign_5d_b"] = mc["mkt_foreign_net_b"].rolling(5).sum()
                 df["mkt_foreign_10d_b"] = mc["mkt_foreign_net_b"].rolling(10).sum()
 
         if not stk_chips.empty:
-            sc = stk_chips.reindex(df.index).ffill()
+            sc = stk_chips.reindex(df.index)
             if "margin_bal" in sc:
-                df["margin_5d_chg_pct"] = sc["margin_bal"].pct_change(5) * 100
-                df["margin_10d_chg_pct"] = sc["margin_bal"].pct_change(10) * 100
-                df["margin_util_pct"] = sc.get("margin_util_pct", np.nan)
-                df["short_margin_ratio"] = sc.get("short_margin_ratio", 0.0)
+                m_bal = sc["margin_bal"].ffill()
+                df["margin_5d_chg_pct"] = _safe_pct_change(m_bal, 5) * 100.0
+                df["margin_10d_chg_pct"] = _safe_pct_change(m_bal, 10) * 100.0
+                df["margin_util_pct"] = sc["margin_util_pct"].ffill() if "margin_util_pct" in sc else np.nan
+                df["short_margin_ratio"] = sc["short_margin_ratio"].ffill() if "short_margin_ratio" in sc else 0.0
             if "smart_money_net" in sc:
-                v5, v10 = stk_v.rolling(5).sum().replace(0, np.nan), stk_v.rolling(10).sum().replace(0, np.nan)
-                df["smart_5d_vol_ratio"] = (sc["smart_money_net"].rolling(5).sum() / v5) * 100
+                sm_net = sc["smart_money_net"].fillna(0.0)
+                tr_net = sc["trust_net"].fillna(0.0) if "trust_net" in sc else pd.Series(0.0, index=df.index)
+                v5 = stk_v.rolling(5).sum().replace(0.0, np.nan)
+                v10 = stk_v.rolling(10).sum().replace(0.0, np.nan)
+                df["smart_5d_vol_ratio"] = (sm_net.rolling(5).sum() / v5) * 100.0
                 df["smart_prev5d_vol_ratio"] = df["smart_5d_vol_ratio"].shift(5)
-                df["smart_10d_vol_ratio"] = (sc["smart_money_net"].rolling(10).sum() / v10) * 100
-                is_sell, is_buy = (sc["trust_net"] < 0).astype(int), (sc["trust_net"] > 0).astype(int)
-                df["trust_consec_sell"] = np.where(is_sell == 1, is_sell.groupby((is_sell != is_sell.shift()).cumsum()).cumsum(), 0)
-                df["trust_consec_buy"] = np.where(is_buy == 1, is_buy.groupby((is_buy != is_buy.shift()).cumsum()).cumsum(), 0)
-                df["trust_prev15_net"] = sc["trust_net"].shift(3).rolling(15).sum()
+                df["smart_10d_vol_ratio"] = (sm_net.rolling(10).sum() / v10) * 100.0
+                is_sell = (tr_net < 0).astype(int)
+                is_buy = (tr_net > 0).astype(int)
+                df["trust_consec_sell"] = np.where(
+                    is_sell == 1, is_sell.groupby((is_sell != is_sell.shift()).cumsum()).cumsum(), 0
+                )
+                df["trust_consec_buy"] = np.where(
+                    is_buy == 1, is_buy.groupby((is_buy != is_buy.shift()).cumsum()).cumsum(), 0
+                )
+                df["trust_prev15_net"] = tr_net.shift(3).rolling(15).sum()
 
-        # 計算個股 60 日 Rolling Beta、自適應籌碼痛點與逆風韌性
-        rolling_beta = compute_rolling_beta(stk_c, twii_c, window=60, min_periods=20)
+        # 逐日向量化計算無前視偏誤之 Rolling Beta、籌碼痛點與逆風韌性
+        beta_series = compute_rolling_beta_series(stk["Close"], twii["Close"], window=60, min_periods=20)
         margin_s = stk_chips["margin_bal"] if (not stk_chips.empty and "margin_bal" in stk_chips) else None
         inst_s = stk_chips["smart_money_net"] if (not stk_chips.empty and "smart_money_net" in stk_chips) else None
-        pain_report = compute_chip_pain_index(stk, margin_s)
-        downside_report = compute_downside_alpha(stk, twii, inst_s, lookback_days=60)
-        resilience_bonus = -5.0 if downside_report.has_badge else 0.0
+
+        pain_df_raw = compute_chip_pain_series(stk, margin_s, vwap_window=20, z_window=60, z_min_periods=20, margin_lag=0)
+        downside_df = compute_downside_alpha_series(stk, twii, inst_s, lookback_days=60)
+
+        # 統一將典型價 20 日 VWAP、每日籌碼痛點與每日逆風加分對齊回大盤交易日曆
+        df["stk_vwap_20"] = pain_df_raw["vwap_20"].reindex(df.index).ffill()
+        df["rolling_beta_60d"] = beta_series.reindex(df.index).ffill().fillna(1.0)
+        df["pain_risk_adj"] = pain_df_raw["pain_risk_adj"].reindex(df.index).ffill().fillna(0.0)
+        df["resilience_bonus"] = downside_df["resilience_bonus"].reindex(df.index).fillna(0.0)
+
+        pain_report = _extract_latest_chip_pain_report(pain_df_raw)
+        downside_report = _extract_latest_downside_report(downside_df)
 
         work_df = df.dropna(subset=["stk_atr_14"]).tail(lookback_days + 15).copy()
         work_df["known_stk_close"] = stk_c.reindex(work_df.index)
+        work_df = work_df.dropna(subset=["known_stk_close"])
         n = len(work_df)
+        if n == 0:
+            raise ValueError(f"股票代號「{stock_id}」歷史交易日數不足，無法完成風控運算。")
 
-        mri_snaps = np.array([
-            self.score_market_snapshot(work_df.iloc[i], news_risk_score=(live_news if i == n - 1 else 50.0))
-            for i in range(n)
-        ], dtype=float)
+        mri_snaps = np.array(
+            [
+                self.score_market_snapshot(work_df.iloc[i], news_risk_score=(live_news if i == n - 1 else 50.0))
+                for i in range(n)
+            ],
+            dtype=float,
+        )
         chip_snaps = np.array([self.score_stock_chips_snapshot(work_df.iloc[i]) for i in range(n)], dtype=float)
 
         combined_q = int(round(quality.quality_score * 0.5 + outlook.outlook_score * 0.5))
         history = []
         base_sri_seq: List[float] = []
-        latest_overlay = None
+        latest_overlay: Optional[AdvancedRiskOverlay] = None
         w_m, w_c = self.cfg.window_days, self.cfg.chip_smooth_days
 
         for i in range(max(0, n - lookback_days), n):
@@ -1551,7 +1721,6 @@ class InstitutionalQuantRiskEngine:
             c_win = chip_snaps[max(0, i - w_c + 1) : i + 1]
             row = work_df.iloc[i]
 
-            # 大盤 MRI
             wma_10 = float(np.average(m_win, weights=self.mri_weights[-len(m_win):]))
             mom = float(np.mean(m_win[-3:]) - np.mean(m_win[:-3])) if len(m_win) >= 6 else 0.0
             trend_adj = min(mom * 0.45, 13.0) if mom >= 5.0 else (max(mom * 0.20, -6.0) if mom <= -7.0 else 0.0)
@@ -1559,19 +1728,21 @@ class InstitutionalQuantRiskEngine:
             persist_adj = 7.0 if high_days >= 7 else (3.5 if high_days >= 5 else 0.0)
             mri_score = int(np.clip(round(max(wma_10 + trend_adj + persist_adj, self._get_lock_floor(row))), 0, 100))
 
-            # 動態權重狀態機 × Rolling Beta
-            w_mri_dyn, w_idio_dyn, base_w_mri, regime_name = get_dynamic_regime_weights(mri_score, rolling_beta)
+            # 嚴格使用當日滾動 Beta、當日籌碼痛點與當日逆風韌性加分（無前視偏誤）
+            day_beta = float(row.get("rolling_beta_60d", 1.0))
+            day_pain_adj = float(row.get("pain_risk_adj", 0.0))
+            day_res_bonus = float(row.get("resilience_bonus", 0.0))
 
-            # 自適應籌碼痛點修正
+            w_mri_dyn, w_idio_dyn, base_w_mri, regime_name = get_dynamic_regime_weights(mri_score, day_beta)
+
             chip_smooth = float(np.average(c_win, weights=self.chip_weights[-len(c_win):]))
-            adj_chip = float(np.clip(chip_smooth + pain_report.risk_adj, 5.0, 98.0))
+            adj_chip = float(np.clip(chip_smooth + day_pain_adj, 5.0, 98.0))
             idio = (
                 adj_chip * self.w.w_stock_chip_in_idio
                 + quality.risk_equivalent * self.w.w_stock_health_in_idio
                 + outlook.risk_equivalent * self.w.w_stock_outlook_in_idio
             )
 
-            # 訊號背離非線性懲罰（趨勢風險改採 ATR 自適應版）
             trend_risk = self.score_stock_trend_risk(row)
             div_penalty, div_warn = detect_divergence_penalty(
                 quality_risk=quality.risk_equivalent,
@@ -1580,23 +1751,22 @@ class InstitutionalQuantRiskEngine:
                 trend_risk=trend_risk,
             )
 
-            base_sri = mri_score * w_mri_dyn + idio * w_idio_dyn + div_penalty + resilience_bonus
+            base_sri = mri_score * w_mri_dyn + idio * w_idio_dyn + div_penalty + day_res_bonus
             if adj_chip > 68.0:
                 base_sri += min((adj_chip - 68.0) * 0.45, 10.0)
             base_sri_seq.append(base_sri)
 
-            # 風險加速度（二階斜率）微調
             vel_3d, vel_tag, vel_adj = evaluate_sri_velocity(base_sri_seq)
             sri_score = int(np.clip(round(base_sri + vel_adj), 0, 100))
 
             if is_last:
                 atr_dd_val = _safe_float(row.get("stk_atr_norm_dd"))
                 dyn_note = (
-                    f"60日 Beta={rolling_beta:.2f}（大盤權重由基準 {int(base_w_mri*100)}% 動態調整為 {int(round(w_mri_dyn*100))}%）；"
+                    f"60日 Beta={day_beta:.2f}（大盤權重由基準 {int(base_w_mri * 100)}% 動態調整為 {int(round(w_mri_dyn * 100))}%）；"
                     f"近3日風險斜率 {vel_3d:+.1f} 分（{vel_tag}）"
                 )
                 dyn_report = DynamicFactorReport(
-                    rolling_beta_60d=rolling_beta,
+                    rolling_beta_60d=day_beta,
                     base_w_mri=base_w_mri,
                     beta_adj_w_mri=w_mri_dyn,
                     sri_velocity_3d=vel_3d,
@@ -1621,16 +1791,18 @@ class InstitutionalQuantRiskEngine:
                 )
 
             sell_p, stop_p = self._calc_prices(sri_score, mri_score, combined_q, row)
-            history.append({
-                "date": work_df.index[i],
-                "close": round(float(row["known_stk_close"]), 2),
-                "vwap_20": round(float(row["stk_vwap_20"]), 2) if pd.notna(row.get("stk_vwap_20")) else np.nan,
-                "mri": mri_score,
-                "sri": sri_score,
-                "chip": int(round(adj_chip)),
-                "sell_p": sell_p,
-                "stop_p": stop_p,
-            })
+            history.append(
+                {
+                    "date": work_df.index[i],
+                    "close": round(float(row["known_stk_close"]), 2),
+                    "vwap_20": round(float(row["stk_vwap_20"]), 2) if pd.notna(row.get("stk_vwap_20")) else np.nan,
+                    "mri": mri_score,
+                    "sri": sri_score,
+                    "chip": int(round(adj_chip)),
+                    "sell_p": sell_p,
+                    "stop_p": stop_p,
+                }
+            )
 
         hist_df = pd.DataFrame(history).set_index("date")
         latest = history[-1]
@@ -1656,7 +1828,7 @@ class InstitutionalQuantRiskEngine:
 # =========================================================
 # 卡片渲染：主動式 Alpha 四象限、動態風控偵測、體質、展望、圖表
 # =========================================================
-def _metric_tag(val, good_cond, bad_cond, good_txt, mid_txt, bad_txt, empty_txt="無資料"):
+def _metric_tag(val, good_cond, bad_cond, good_txt: str, mid_txt: str, bad_txt: str, empty_txt: str = "無資料") -> str:
     """依數值條件回傳對應顏色與文字的指標狀態標籤"""
     if val is None or pd.isna(val):
         return f'<span class="m-tag" style="color:#6e7681;">{empty_txt}</span>'
@@ -1667,7 +1839,7 @@ def _metric_tag(val, good_cond, bad_cond, good_txt, mid_txt, bad_txt, empty_txt=
     return f'<span class="m-tag tag-mid">{mid_txt}</span>'
 
 
-def render_active_alpha_card(aa: ActiveAlphaReport):
+def render_active_alpha_card(aa: ActiveAlphaReport) -> None:
     """渲染主動式進攻評分與四象限決策卡片"""
     score_col = "#3fb950" if aa.alpha_score >= 60 else ("#ff7b72" if aa.alpha_score < 42 else "#e3b341")
     rs_t = (
@@ -1686,7 +1858,8 @@ def render_active_alpha_card(aa: ActiveAlphaReport):
     sq_str = f"{aa.vol_squeeze_ratio:.2f}x" if aa.vol_squeeze_ratio is not None else "N/A"
     sig_html = "".join([f"<div>⚡ {s}</div>" for s in aa.signals])
 
-    _render_html(f"""<div class="risk-card">
+    _render_html(
+        f"""<div class="risk-card">
         <div class="card-title">🎯 主動式進攻因子 (Active Alpha) ＆ 四象限定位</div>
         <div style="display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-top:4px;">
             <span style="font-size:1.45rem;font-weight:700;color:{score_col};">{aa.alpha_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> 【{aa.rating}】</span>
@@ -1714,13 +1887,18 @@ def render_active_alpha_card(aa: ActiveAlphaReport):
             </div>
         </div>
         <div class="health-list">{sig_html}</div>
-        </div>""")
+        </div>"""
+    )
 
 
-def render_advanced_overlay_card(ov: AdvancedRiskOverlay):
-    """渲染動態量化風控偵測卡片（Beta 狀態機、風險加速度、自適應籌碼痛點、逆風韌性、背離警示）"""
+def render_advanced_overlay_card(ov: AdvancedRiskOverlay) -> None:
+    """渲染動態量化風控偵測卡片"""
     dyn = ov.dynamic_factors
-    vel_cls = "badge-red" if dyn.velocity_tag == "加速惡化" else ("badge-yellow" if dyn.velocity_tag == "緩步升溫" else ("badge-green" if dyn.velocity_tag == "風險收斂" else "badge-blue"))
+    vel_cls = (
+        "badge-red" if dyn.velocity_tag == "加速惡化" else
+        ("badge-yellow" if dyn.velocity_tag == "緩步升溫" else
+         ("badge-green" if dyn.velocity_tag == "風險收斂" else "badge-blue"))
+    )
 
     badges_html = f'<span class="badge-yellow">狀態機：{ov.regime_name}</span>'
     badges_html += f'<span class="{vel_cls}">斜率：{dyn.velocity_tag} ({dyn.sri_velocity_3d:+.1f})</span>'
@@ -1740,7 +1918,8 @@ def render_advanced_overlay_card(ov: AdvancedRiskOverlay):
             f'{ov.divergence_warning}（風險分 +{ov.divergence_penalty:.0f}）</div>'
         )
 
-    _render_html(f"""<div class="risk-card">
+    _render_html(
+        f"""<div class="risk-card">
         <div class="card-title">🧠 動態風控引擎偵測（Beta 狀態機 / 風險加速度 / Z-Score 痛點 / 逆風韌性）</div>
         <div style="margin:6px 0 8px 0;">{badges_html}</div>
         {div_html}
@@ -1749,10 +1928,11 @@ def render_advanced_overlay_card(ov: AdvancedRiskOverlay):
         <div>• <b>籌碼痛點 (20日VWAP)：</b>{ov.pain_report.note}</div>
         <div>• <b>逆風韌性 (Downside Alpha)：</b>{ov.downside_alpha.note}</div>
         </div>
-        </div>""")
+        </div>"""
+    )
 
 
-def render_health_card(q: FundamentalQualityReport):
+def render_health_card(q: FundamentalQualityReport) -> None:
     """渲染歷史財務體質健檢卡片"""
     roe_t = _metric_tag(q.roe_pct, lambda x: x >= 15, lambda x: x < 5, "優異", "穩健", "偏弱")
     op_t = _metric_tag(q.op_margin_pct, lambda x: x >= 15, lambda x: x < 3, "高毛利", "普通", "偏薄")
@@ -1762,7 +1942,8 @@ def render_health_card(q: FundamentalQualityReport):
     pb_str = f"{q.pb:.2f}x" if q.pb is not None else "N/A"
     str_html = "".join([f"<div>✅ {s}</div>" for s in q.strengths])
     warn_html = "".join([f"<div>⚠️ {w}</div>" for w in q.warnings]) if q.warnings else "<div>✨ 目前無明顯財務警訊</div>"
-    _render_html(f"""<div class="risk-card">
+    _render_html(
+        f"""<div class="risk-card">
         <div class="card-title">📊 個股財務體質健檢（來源：{q.source_note}）</div>
         <div style="font-size:1.35rem;font-weight:700;color:#f0f6fc;">{q.quality_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{q.rating}】</div>
         <div class="metric-grid">
@@ -1773,10 +1954,11 @@ def render_health_card(q: FundamentalQualityReport):
         <div class="metric-box"><div class="m-label">淨值比 PB</div><div class="m-val">{pb_str}</div>{pb_t}</div>
         </div>
         <div class="health-list">{str_html}{warn_html}</div>
-        </div>""")
+        </div>"""
+    )
 
 
-def render_outlook_card(o: ForwardOutlookReport):
+def render_outlook_card(o: ForwardOutlookReport) -> None:
     """渲染未來展望與法人預期卡片"""
     eps_t = _metric_tag(o.implied_eps_growth_pct, lambda x: x >= 15, lambda x: x <= -5, "看增", "平穩", "看減", "無預估")
     tgt_t = _metric_tag(o.target_upside_pct, lambda x: x >= 18, lambda x: x <= -5, "具空間", "合理", "偏貴", "無外資追蹤")
@@ -1787,7 +1969,8 @@ def render_outlook_card(o: ForwardOutlookReport):
     score_col = "#3fb950" if o.outlook_score >= 66 else ("#ff7b72" if o.outlook_score < 48 else "#e3b341")
     str_html = "".join([f"<div>🚀 {s}</div>" for s in o.strengths])
     warn_html = "".join([f"<div>⚠️ {w}</div>" for w in o.warnings]) if o.warnings else ""
-    _render_html(f"""<div class="risk-card">
+    _render_html(
+        f"""<div class="risk-card">
         <div class="card-title">🔮 未來展望與法人預期</div>
         <div style="font-size:1.35rem;font-weight:700;color:{score_col};">{o.outlook_score} <span style="font-size:0.95rem;color:#8b949e;">/ 100</span> &nbsp;【{o.rating}】</div>
         <div class="outlook-grid">
@@ -1811,10 +1994,11 @@ def render_outlook_card(o: ForwardOutlookReport):
         </div>
         </div>
         <div class="health-list">{str_html}{warn_html}</div>
-        </div>""")
+        </div>"""
+    )
 
 
-def render_dark_chart(res: Dict):
+def render_dark_chart(res: Dict) -> None:
     """繪製雙層深色互動圖表：上層為收盤價、20日VWAP與動態賣出/防守價；下層為大盤 MRI 與個股 SRI"""
     df = res["hist_df"]
     fig = make_subplots(
@@ -1850,7 +2034,7 @@ def render_dark_chart(res: Dict):
 
 
 # =========================================================
-# 側邊欄：FinMind Token 設定與 v10 模型說明
+# 側邊欄：FinMind Token 設定與 v10.2 模型說明
 # =========================================================
 with st.sidebar:
     st.markdown("### ⚙️ 系統連線設定")
@@ -1862,10 +2046,11 @@ with st.sidebar:
     )
     st.caption(
         "風控燈號 (SRI / MRI)：\n🟢 安全 (<48)\n🟡 中等 (48~64)\n🔴 危險 (≥65)\n\n"
-        "v10 動態狀態機 × Rolling Beta：\n"
-        "• MRI < 45：基準 15% × Beta\n"
-        "• 45 ≤ MRI < 70：基準 40% × Beta\n"
-        "• MRI ≥ 70：基準 65% × Beta\n\n"
+        "v10.2 無前視偏誤升級：\n"
+        "• 逐日滾動 60 日 Beta 狀態機\n"
+        "• 逐日滾動 20 日典型價 VWAP 痛點\n"
+        "• 逐日滾動 60 日逆風抗跌係數\n"
+        "• 美股總經 +1 日 PIT 時間對齊\n\n"
         "四象限定位（SRI 52 / Alpha 60）：\n"
         "• 🚀 主升段首選：低險＋高攻\n"
         "• 🛡️ 防禦盤整：低險＋低攻\n"
@@ -1877,7 +2062,7 @@ with st.sidebar:
 # =========================================================
 # 主介面：雙分頁（單股雙軸診斷 / 多股批量掃描）
 # =========================================================
-st.markdown("## 🛡️ 台股量化風控儀表板 v10.1")
+st.markdown("## 🛡️ 台股量化風控儀表板 v10.2")
 tab1, tab2 = st.tabs(["🔍 單股雙軸診斷", "📋 多股批量掃描"])
 engine = InstitutionalQuantRiskEngine()
 
@@ -1907,52 +2092,53 @@ with tab1:
                 aa = ov.active_alpha
                 mri_weight_pct = int(round(ov.w_mri_dynamic * 100))
 
-                _render_html(f"### {res['display_name']} &nbsp; <span class='{aa.quadrant_badge_cls}' style='vertical-align:middle;'>{aa.quadrant}</span>")
-                st.caption(f"基準日：{res['date']} ｜ 收盤價：{res['close']} 元 ｜ 60日 Beta：{dyn.rolling_beta_60d:.2f} ｜ 籌碼：{res['stk_note']}")
+                _render_html(
+                    f"### {res['display_name']} &nbsp; <span class='{aa.quadrant_badge_cls}' style='vertical-align:middle;'>{aa.quadrant}</span>"
+                )
+                st.caption(
+                    f"基準日：{res['date']} ｜ 收盤價：{res['close']} 元 ｜ 60日 Beta：{dyn.rolling_beta_60d:.2f} ｜ 籌碼：{res['stk_note']}"
+                )
 
-                # 第一排：個股風險 SRI 與大盤風險 MRI（含動態 Beta 權重與風險斜率）
                 c1, c2 = st.columns(2)
                 with c1:
-                    _render_html(f"""<div class="risk-card">
+                    _render_html(
+                        f"""<div class="risk-card">
                         <div class="card-title">個股風險指數 (SRI)</div>
                         <div class="card-value" style="color:{s_col};">{s_icon} {res['sri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
                         <div class="card-sub"><span class="{s_cls}">{s_stat}</span> 3日斜率 {dyn.sri_velocity_3d:+.1f}｜籌碼 {res['chip']}</div>
-                        </div>""")
+                        </div>"""
+                    )
                 with c2:
-                    _render_html(f"""<div class="risk-card">
+                    _render_html(
+                        f"""<div class="risk-card">
                         <div class="card-title">大盤風險指數 (MRI)</div>
                         <div class="card-value" style="color:{m_col};">{m_icon} {res['mri']} <span style="font-size:1rem;color:#8b949e;">/ 100</span></div>
                         <div class="card-sub"><span class="{m_cls}">{m_stat}</span> Beta權重 {mri_weight_pct}%</div>
-                        </div>""")
+                        </div>"""
+                    )
 
-                # 第二排：動態建議賣出價與下檔防守價
                 c3, c4 = st.columns(2)
                 with c3:
-                    _render_html(f"""<div class="risk-card">
+                    _render_html(
+                        f"""<div class="risk-card">
                         <div class="card-title">建議賣出價（目標調節區）</div>
                         <div class="card-value" style="color:#d2a8ff;">{res['sell_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
                         <div class="card-sub">距收盤 {sell_pct:+.1f}%</div>
-                        </div>""")
+                        </div>"""
+                    )
                 with c4:
-                    _render_html(f"""<div class="risk-card">
+                    _render_html(
+                        f"""<div class="risk-card">
                         <div class="card-title">下檔防守價</div>
                         <div class="card-value" style="color:#f0883e;">{res['stop_p']:.1f} <span style="font-size:0.9rem;">元</span></div>
                         <div class="card-sub">距收盤 {stop_pct:+.1f}%</div>
-                        </div>""")
+                        </div>"""
+                    )
 
-                # 第三排：主動式進攻因子與四象限卡片
                 render_active_alpha_card(aa)
-
-                # 第四排：動態量化風控偵測卡片
                 render_advanced_overlay_card(ov)
-
-                # 第五排：未來展望與法人預期卡片
                 render_outlook_card(res["outlook"])
-
-                # 第六排：歷史財務體質健檢卡片
                 render_health_card(res["quality"])
-
-                # 第七排：互動式走勢圖
                 render_dark_chart(res)
 
             except Exception as e:
@@ -1999,31 +2185,35 @@ with tab2:
                     elif ov_b.pain_report.status == "籌碼乾淨":
                         tags.append("💎乾淨")
 
-                    rows.append({
-                        "標的": r["display_name"],
-                        "四象限": aa_b.quadrant,
-                        "收盤價": r["close"],
-                        "個股風險": f"{s_i} {r['sri']} ({dyn_b.sri_velocity_3d:+.0f})",
-                        "主動Alpha": f"{aa_b.alpha_score} ({aa_b.rating})",
-                        "Beta": dyn_b.rolling_beta_60d,
-                        "進階訊號": " ".join(tags) if tags else "-",
-                        "建議賣出價": f"{r['sell_p']:.1f} ({sell_pct:+.1f}%)",
-                        "下檔防守價": r["stop_p"],
-                        "大盤MRI": f"{m_i} {r['mri']}",
-                    })
+                    rows.append(
+                        {
+                            "標的": r["display_name"],
+                            "四象限": aa_b.quadrant,
+                            "收盤價": r["close"],
+                            "個股風險": f"{s_i} {r['sri']} ({dyn_b.sri_velocity_3d:+.0f})",
+                            "主動Alpha": f"{aa_b.alpha_score} ({aa_b.rating})",
+                            "Beta": dyn_b.rolling_beta_60d,
+                            "進階訊號": " ".join(tags) if tags else "-",
+                            "建議賣出價": f"{r['sell_p']:.1f} ({sell_pct:+.1f}%)",
+                            "下檔防守價": r["stop_p"],
+                            "大盤MRI": f"{m_i} {r['mri']}",
+                        }
+                    )
                 except Exception as e:
-                    rows.append({
-                        "標的": tid,
-                        "四象限": "-",
-                        "收盤價": None,
-                        "個股風險": f"失敗({str(e)[:12]})",
-                        "主動Alpha": "-",
-                        "Beta": None,
-                        "進階訊號": "-",
-                        "建議賣出價": "-",
-                        "下檔防守價": None,
-                        "大盤MRI": "-",
-                    })
+                    rows.append(
+                        {
+                            "標的": tid,
+                            "四象限": "-",
+                            "收盤價": None,
+                            "個股風險": f"失敗({str(e)[:12]})",
+                            "主動Alpha": "-",
+                            "Beta": None,
+                            "進階訊號": "-",
+                            "建議賣出價": "-",
+                            "下檔防守價": None,
+                            "大盤MRI": "-",
+                        }
+                    )
                 prog.progress((idx + 1) / len(tickers))
             prog.empty()
             status_txt.empty()
@@ -2033,5 +2223,6 @@ with tab2:
         st.dataframe(st.session_state["batch_results"], use_container_width=True, hide_index=True)
 
 # 底部免責聲明
-_render_html('<div class="disclaimer">本系統所有數據與風險指標皆由公開資訊與量化演算法自動運算產生，僅供風險控管參考，絕非投資買賣建議。<br>投資人應獨立判斷並自負盈虧與法律責任。</div>')
-
+_render_html(
+    '<div class="disclaimer">本系統所有數據與風險指標皆由公開資訊與量化演算法自動運算產生，僅供風險控管參考，絕非投資買賣建議。<br>投資人應獨立判斷並自負盈虧與法律責任。</div>'
+)
